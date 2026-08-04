@@ -57,5 +57,3 @@ jobs:
       - name: Publish
         if: steps.version.outputs.exists == 'false'
         run: pnpm publish --access public --provenance --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
