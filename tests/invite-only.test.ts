@@ -226,6 +226,7 @@ describe("invite-only mode", () => {
     const row = await findInviteRow(auth, inviteId);
     expect(row?.tokenHash).not.toBe(token);
     const res = await auth.api.acceptInvite({ body: { token, password: "password123" } });
+    if (!("user" in res)) throw new Error("expected an accepted response");
     expect(res.user.email).toBe("hash@test.com");
   });
 
@@ -376,6 +377,7 @@ describe("invite-only mode", () => {
     const res = await auth.api.acceptInvite({
       body: { token: "stale-token-1", password: "password123", email: "stale1@test.com" }
     });
+    if (!("user" in res)) throw new Error("expected an accepted response");
     expect(res.user.email).toBe("stale1@test.com");
 
     const auth2 = await createTestAuth({ invite: { validRoles: ["user"], onInvalidRole } });
@@ -535,10 +537,12 @@ describe("invite-only mode", () => {
     const u1 = await findUserByEmail(auth, "p1@test.com");
     expect(u1?.emailVerified).toBe(false);
 
-    const dup = await captureError(() =>
-      auth.api.acceptInvite({ body: { token, password: "password123", email: "p1@test.com" } })
-    );
-    expect(dup?.status).toBe("CONFLICT");
+    // A taken email is not confirmed to the caller; they are sent to sign-in.
+    const dup = await auth.api.acceptInvite({
+      body: { token, password: "password123", email: "p1@test.com" }
+    });
+    if (!("action" in dup)) throw new Error("expected a sign-in redirect");
+    expect(dup.action).toBe("SIGN_IN_REQUIRED");
 
     await auth.api.acceptInvite({ body: { token, password: "password123", email: "p2@test.com" } });
     const over = await captureError(() =>
@@ -649,6 +653,39 @@ describe("invite-only mode", () => {
     expect(await findInviteRow(auth, liveId)).toBeTruthy();
   });
 
+  it("cleanupExpiredInvites drains across batches and fires the hook per invite", async () => {
+    const onInviteDeleted = vi.fn();
+    const auth = await createTestAuth({ invite: { onInviteDeleted } });
+    const headers = await seedAdmin(auth);
+    const expiredIds: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const { inviteId } = await createInvite(auth, {
+        body: { type: "private", email: `batch${i}@test.com`, role: "user" },
+        headers
+      });
+      await expireInvite(auth, inviteId);
+      expiredIds.push(inviteId);
+    }
+    const { inviteId: liveId } = await createInvite(auth, {
+      body: { type: "private", email: "still-live@test.com", role: "user" },
+      headers
+    });
+
+    // batchSize 2 forces three loop passes over the five expired rows.
+    const result = await auth.api.cleanupExpiredInvites({ body: { batchSize: 2 } });
+    expect(result.deleted).toBe(5);
+    expect(onInviteDeleted).toHaveBeenCalledTimes(5);
+    for (const id of expiredIds) {
+      expect(await findInviteRow(auth, id)).toBeFalsy();
+    }
+    for (let i = 0; i < 5; i++) {
+      // Inert pre-created users are gone with their invites.
+      expect(await findUserByEmail(auth, `batch${i}@test.com`)).toBeFalsy();
+    }
+    expect(await findInviteRow(auth, liveId)).toBeTruthy();
+    expect(await findUserByEmail(auth, "still-live@test.com")).toBeTruthy();
+  });
+
   it("list paginates and filters, including derived expired; non-admin is forbidden", async () => {
     const auth = await createTestAuth();
     const headers = await seedAdmin(auth);
@@ -714,6 +751,62 @@ describe("invite-only mode", () => {
       auth: { emailAndPassword: { enabled: true, disableSignUp: false } }
     });
     expect(auth).toBeTruthy();
+  });
+
+  it("public accept with an existing email returns SIGN_IN_REQUIRED, never confirming the account", async () => {
+    const auth = await createTestAuth();
+    const headers = await seedAdmin(auth);
+    await seedUser(auth, { email: "resident@test.com", password: "resident-pass-123" });
+    const created = await createInvite(auth, {
+      body: { type: "public", role: "user", maxUses: 5 },
+      headers
+    });
+    // biome-ignore lint/suspicious/noExplicitAny: response is a union shape
+    const res: any = await auth.api.acceptInvite({
+      body: {
+        token: created.token,
+        password: "brand-new-pass-123",
+        email: "resident@test.com"
+      }
+    });
+    expect(res.action).toBe("SIGN_IN_REQUIRED");
+    expect(res.callbackURL).toContain(created.token);
+    // No use consumed, and the resident's password is untouched.
+    const row = await findInviteRow(auth, created.inviteId);
+    expect(row?.useCount).toBe(0);
+    const stillSignsIn = await signInHeaders(auth, "resident@test.com", "resident-pass-123");
+    expect(stillSignsIn.get("cookie")).toBeTruthy();
+  });
+
+  it("OAuth linking to a pre-created user is blocked while pending and after revocation", async () => {
+    const auth = await createTestAuth();
+    const headers = await seedAdmin(auth);
+    const created = await auth.api.createInvite({
+      body: { type: "private", email: "linkme@test.com", role: "user" },
+      headers
+    });
+    const user = await findUserByEmail(auth, "linkme@test.com");
+    const ctx = await auth.$context;
+    // The account.create.before hook fires inside better-auth's request
+    // context (AsyncLocalStorage), which tests cannot enter; invoke the
+    // registered hook directly with the same arguments it receives there.
+    // biome-ignore lint/suspicious/noExplicitAny: dynamic plugin access
+    const plugin = (auth.options.plugins as any[]).find((p) => p.id === "better-enrollment");
+    const hook = plugin.init(ctx).options.databaseHooks.account.create.before;
+    const link = () =>
+      hook(
+        { userId: user!.id, providerId: "google", accountId: "google-linkme" },
+        { context: ctx }
+      );
+
+    const pendingBlock = await captureError(link);
+    expect(pendingBlock?.code).toBe("INVITATION_REQUIRED");
+
+    await auth.api.revokeInvite({ body: { inviteId: created.inviteId }, headers });
+    // The cancelled invite leaves the same inert user; linking stays blocked.
+    const revokedBlock = await captureError(link);
+    expect(revokedBlock?.code).toBe("INVITATION_REQUIRED");
+    expect(await findAccounts(auth, user!.id)).toHaveLength(0);
   });
 
   it("auto mode detects a closed app as invite-only and a mixed config throws", async () => {

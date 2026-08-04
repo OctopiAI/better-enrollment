@@ -197,6 +197,41 @@ describe("org-join creation gate", () => {
     expect((await findInviteRow(auth, created.inviteId))?.role).toBe("user");
   });
 
+  it("one email may hold pending org-join invites in different orgs, but not twice in one", async () => {
+    const { auth, org, ownerHeaders } = await setupOrg();
+    await seedUser(auth, {
+      email: "owner2@beta.com",
+      password: PASSWORD,
+      name: "Owner Two"
+    });
+    const owner2Headers = await signInHeaders(auth, "owner2@beta.com", PASSWORD);
+    const org2 = await api(auth).createOrganization({
+      body: { name: "Beta", slug: "beta" },
+      headers: owner2Headers
+    });
+
+    await createInvite(auth, {
+      body: { kind: "org-join", email: "multi@test.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    // A second org inviting the same email is legitimate, and the scoped
+    // check means org2's owner learns nothing about org1's invites.
+    const second = await createInvite(auth, {
+      body: { kind: "org-join", email: "multi@test.com", organizationId: org2.id },
+      headers: owner2Headers
+    });
+    expect(second.token).toBeTruthy();
+    // Within one org the email lock still holds.
+    expect(
+      await errCode(
+        createInvite(auth, {
+          body: { kind: "org-join", email: "multi@test.com", organizationId: org.id },
+          headers: ownerHeaders
+        })
+      )
+    ).toBe("EMAIL_ALREADY_INVITED");
+  });
+
   it("canCreateOrgInvites override replaces the permission check", async () => {
     const { auth, org, ownerHeaders } = await setupOrg({
       invite: {
@@ -1159,6 +1194,40 @@ describe("platform controls", () => {
     expect(res.organization?.id).toBe(org.id);
   });
 
+  it("disable also covers slug and active-organization addressing", async () => {
+    const { auth, org, ownerHeaders, adminHeaders } = await setupOrg();
+    // Active org set while the org is still enabled.
+    await api(auth).setActiveOrganization({
+      body: { organizationId: org.id },
+      headers: ownerHeaders
+    });
+    await api(auth).disableOrg({
+      body: { organizationId: org.id },
+      headers: adminHeaders
+    });
+    // Addressed by slug instead of id.
+    expect(
+      await errCode(
+        api(auth).getFullOrganization({
+          query: { organizationSlug: org.slug },
+          headers: ownerHeaders
+        })
+      )
+    ).toBe("ORG_DISABLED");
+    // Addressed implicitly through the session's active organization.
+    expect(
+      await errCode(
+        api(auth).getFullOrganization({
+          query: {},
+          headers: ownerHeaders
+        })
+      )
+    ).toBe("ORG_DISABLED");
+    // Listing stays available so the user can switch to another org.
+    const orgs = await api(auth).listOrganizations({ headers: ownerHeaders });
+    expect(Array.isArray(orgs)).toBe(true);
+  });
+
   it("delete removes the org, memberships, teams, and invites; users keep accounts", async () => {
     let deletedEvent: { bannedMembers: number } | null = null;
     const { auth, org, ownerHeaders, adminHeaders, owner } = await setupOrg({
@@ -1455,6 +1524,35 @@ describe("existing-user activation invites (invite-only)", () => {
         })
       )
     ).toBe("EMAIL_MISMATCH");
+  });
+
+  it("direct accept on an activation invite cannot overwrite the account's password", async () => {
+    const { auth, ownerHeaders, org } = await setupOrg();
+    const dana = await seedUser(auth, {
+      email: "dana@app.com",
+      password: "dana-real-password"
+    });
+    // Existing account, so this is an activation invite: no pre-created user.
+    const created = await createInvite(auth, {
+      body: { kind: "org-join", email: "dana@app.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    const res = await api(auth).acceptInvite({
+      body: { token: created.token, password: "attacker-pass-999" }
+    });
+    expect(res.action).toBe("SIGN_IN_REQUIRED");
+    expect(res.callbackURL).toContain(created.token);
+
+    // Nothing consumed, nothing changed: the real password still signs in
+    // and the invite remains redeemable through the activation flow.
+    expect((await findInviteRow(auth, created.inviteId))?.useCount).toBe(0);
+    const headers = await signInHeaders(auth, "dana@app.com", "dana-real-password");
+    const redeemed = await api(auth).redeemInvite({
+      body: { token: created.token },
+      headers
+    });
+    expect(redeemed.action).toBe("ACCEPTED");
+    expect(await getMemberRow(auth, dana.id, org.id)).toBeTruthy();
   });
 
   it("app-kind invite to an existing user still conflicts", async () => {

@@ -16,7 +16,8 @@ const inviteFields = {
     type: "string",
     required: true,
     input: false,
-    defaultValue: "pending"
+    defaultValue: "pending",
+    index: true
   },
   mode: { type: "string", required: true, input: false },
   // Plain columns, no FK: org rows may be removed by the org plugin's own
@@ -27,10 +28,10 @@ const inviteFields = {
   presetSeatLimit: { type: "number", required: false, input: false },
   preCreatedUserId: { type: "string", required: false, input: false },
   // No FK: accepted invites outlive their inviter (denormalized fields).
-  createdByUserId: { type: "string", required: false, input: false },
+  createdByUserId: { type: "string", required: false, input: false, index: true },
   inviterName: { type: "string", required: true, input: false },
   inviterEmail: { type: "string", required: true, input: false },
-  expiresAt: { type: "date", required: false, input: false },
+  expiresAt: { type: "date", required: false, input: false, index: true },
   maxUses: { type: "number", required: false, input: false },
   useCount: { type: "number", required: true, input: false, defaultValue: 0 },
   revokedAt: { type: "date", required: false, input: false },

@@ -138,7 +138,9 @@ export const authClient = createAuthClient({
 
 ## The two modes
 
-`mode` accepts `"auto"` (default), `"invite-only"`, or `"open"`. In `auto` the plugin inspects your config at startup: everything closed means invite-only, everything open means open, and a mixed config throws with a message naming each path, asking you to set `mode` explicitly. Detection cannot see sign-up paths added by other plugins (magic link, OTP, passkey), so set `mode` explicitly if you use those.
+`mode` accepts `"auto"` (default), `"invite-only"`, or `"open"`. In `auto` the plugin inspects your config at startup: everything closed means invite-only, everything open means open, and a mixed config throws with a message naming each path, asking you to set `mode` explicitly.
+
+> **Your responsibility, for now:** detection only sees `emailAndPassword` and `socialProviders`. Sign-up paths added by other plugins (magic link, email OTP, passkey, phone number, anonymous, generic OAuth) are invisible to it and are NOT blocked at runtime, so any of them silently bypasses invite-only mode. If you use one, you must close or remove its sign-up path yourself. A runtime backstop that rejects non-invite user creation is on the [roadmap](#roadmap).
 
 **`invite-only`**: all sign-up routes are disabled and the plugin creates users through Better Auth's internal adapter. Setting it explicitly while a sign-up path is still open throws at init; `allowOpenSignup: true` downgrades that to a warning, and the guarantee becomes per-email: pending invites still lock their own address while everyone else signs up freely.
 
@@ -484,7 +486,9 @@ After acceptance the user is verified, so OAuth linking works normally.
 
 The password-reset hook exists because a private invite pre-creates an inert user, which locks the email. Without it, whoever controls the mailbox could set a password through the reset flow and skip the invite entirely, and outsiders could probe the endpoint to learn who has been invited. The hook returns Better Auth's own generic success response, byte-identical to the unknown-email case, and sends nothing.
 
-An address stays locked while a pending invite row exists for it, even past `expiresAt`; re-inviting returns `CONFLICT`. `invite.delete` removes a pending or cancelled invite plus its still-inert pre-created user, which frees the address. Accepted invites are permanent audit records and cannot be deleted.
+An address stays locked while a pending invite row exists for it, even past `expiresAt`; re-inviting returns `CONFLICT`. The lock is global for `app` and `org-create` invites but per-organization for `org-join`, so the same person can hold pending invites to several orgs, and an org inviter cannot probe for pending invites outside their own org. `invite.delete` removes a pending or cancelled invite plus its still-inert pre-created user, which frees the address. Accepted invites are permanent audit records and cannot be deleted.
+
+Revoking is softer than deleting: the pre-created user stays behind, so both the password-reset hook and the OAuth-linking hook keep blocking for any non-accepted invite (pending or cancelled), not just pending ones. When a signed-out visitor tries to accept a public invite with an email that already has an account, the response is the same `SIGN_IN_REQUIRED` action the activation flow uses, so the endpoint never confirms whether an account exists. The same guard covers activation invites called through `/invite/accept` directly: an invite issued to an already-established account can only merge inside that account's own session, never set its password from the token. The invite token proves mailbox control; changing or joining an existing account requires proof of account control, which is a session.
 
 Tokens are `generateRandomString(32)` from Better Auth's crypto module, roughly 190 bits of entropy, stored as SHA-256 base64url and looked up by hash.
 
@@ -517,6 +521,15 @@ haveIBeenPwned({
 ```ts
 organization({ allowUserToCreateOrganization: roleGate(["admin", "org-creator"]) });
 ```
+
+---
+
+## Operations at scale
+
+- **Expired-invite cleanup** is batched: `POST /invite/cleanup-expired` (server-only) deletes in passes of `batchSize` (default 500, max 5000) until drained, so table size never dictates the request's memory or duration. Run it on a cron.
+- **Bulk org operations** (`disableOrg` with `banMembers`, `deleteOrg`) read and delete in pages of 1000, so they stay within driver bind-parameter limits on orgs of any size.
+- **Indexes**: the schema indexes `email`, `organizationId`, `tokenHash` (unique), `status`, `expiresAt`, and `createdByUserId`. If your invite table grows into the millions, consider adding composite indexes `(email, status)` and `(organizationId, status)` in your own migrations; Better Auth's schema DSL only expresses single-column indexes.
+- **Rate limits** ship with the plugin (5/min on redemption endpoints, 10/min on `get`/`check-slug`) but Better Auth stores counters in memory by default. If you run more than one instance, configure Better Auth's `rateLimit.storage` (e.g. `"secondary-storage"` with Redis) so the limits are shared instead of per-pod.
 
 ---
 
@@ -557,6 +570,10 @@ import { INVITE_ERROR_CODES } from "@octopi-ai/better-enrollment";
 A Prisma example lives in [`examples/prisma`](./examples/prisma).
 
 ---
+
+## Roadmap
+
+- **Runtime sign-up backstop for invite-only mode.** A `user.create` database hook that rejects any user creation not originating from this plugin's own flows (or the admin plugin), so sign-up paths the mode detection cannot see (magic link, email OTP, passkey, phone number, anonymous, generic OAuth) are blocked at runtime instead of by configuration discipline alone. Until this lands, closing those paths is the developer's responsibility.
 
 ## License
 

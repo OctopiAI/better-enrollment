@@ -136,6 +136,11 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
   };
   const orgEnabled = () => !!orgOpts && state.orgPluginPresent;
 
+  // Bulk operations read and delete in pages of this size, so neither
+  // memory nor IN-clause length grows with table size (drivers cap bind
+  // parameters, e.g. 65535 on Postgres).
+  const DB_PAGE = 1000;
+
   async function findInviteByToken(
     ctx: GenericEndpointContext,
     token: string
@@ -459,16 +464,25 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       model: "member",
       where: [{ field: "organizationId", value: organizationId }]
     });
-    const pending = await ctx.context.adapter.findMany<Invite>({
-      model: "invite",
-      where: [
-        { field: "organizationId", value: organizationId },
-        { field: "status", value: "pending" }
-      ],
-      limit: 100000
-    });
+    // Reservation math needs each row's maxUses/useCount, so this cannot
+    // be a count; paging keeps memory flat for invite-heavy orgs.
     const now = new Date();
-    const reserved = pending.reduce((sum, i) => sum + reservedSeats(i, now), 0);
+    let reserved = 0;
+    let offset = 0;
+    for (;;) {
+      const pending = await ctx.context.adapter.findMany<Invite>({
+        model: "invite",
+        where: [
+          { field: "organizationId", value: organizationId },
+          { field: "status", value: "pending" }
+        ],
+        limit: DB_PAGE,
+        offset
+      });
+      reserved += pending.reduce((sum, i) => sum + reservedSeats(i, now), 0);
+      if (pending.length < DB_PAGE) break;
+      offset += DB_PAGE;
+    }
     return { members, reserved };
   }
 
@@ -673,26 +687,35 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     ctx: GenericEndpointContext,
     organizationId: string
   ): Promise<number> {
-    const members = await ctx.context.adapter.findMany<MemberRecord>({
-      model: "member",
-      where: [{ field: "organizationId", value: organizationId }],
-      limit: 100000
-    });
-    const ids = [...new Set(members.map((m) => m.userId))];
-    if (ids.length === 0) return 0;
-    await ctx.context.adapter.updateMany({
-      model: "user",
-      where: [{ field: "id", value: ids, operator: "in" }],
-      update: {
-        banned: true,
-        banReason: "Organization suspended by administrator"
-      }
-    });
-    await ctx.context.adapter.deleteMany({
-      model: "session",
-      where: [{ field: "userId", value: ids, operator: "in" }]
-    });
-    return ids.length;
+    // Member rows are not deleted here, so offset paging is stable.
+    let offset = 0;
+    let banned = 0;
+    for (;;) {
+      const members = await ctx.context.adapter.findMany<MemberRecord>({
+        model: "member",
+        where: [{ field: "organizationId", value: organizationId }],
+        limit: DB_PAGE,
+        offset
+      });
+      if (members.length === 0) break;
+      const ids = [...new Set(members.map((m) => m.userId))];
+      await ctx.context.adapter.updateMany({
+        model: "user",
+        where: [{ field: "id", value: ids, operator: "in" }],
+        update: {
+          banned: true,
+          banReason: "Organization suspended by administrator"
+        }
+      });
+      await ctx.context.adapter.deleteMany({
+        model: "session",
+        where: [{ field: "userId", value: ids, operator: "in" }]
+      });
+      banned += ids.length;
+      if (members.length < DB_PAGE) break;
+      offset += DB_PAGE;
+    }
+    return banned;
   }
 
   async function requireOrgFeatures(): Promise<void> {
@@ -732,6 +755,21 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       }
       if (isBanned(target)) {
         throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.USER_BANNED);
+      }
+      // An invite issued to an already-established account is an activation
+      // invite: merging into it requires the owner's session, not the token.
+      // Without this, accept would overwrite the account's credential. Only
+      // the invite's own pre-created shell is claimable through accept, so
+      // a retry whose earlier attempt already wrote the credential still
+      // passes, while accounts somebody owns are routed to sign-in.
+      if (!invite.preCreatedUserId) {
+        const targetAccounts = await ctx.context.internalAdapter.findAccounts(target.id);
+        if (targetAccounts.length > 0) {
+          return ctx.json({
+            action: "SIGN_IN_REQUIRED" as const,
+            callbackURL: buildInviteUrl(ctx, body.token, invite.type)
+          });
+        }
       }
       const claimed = await claimUse(ctx, invite);
       if (!claimed) {
@@ -812,7 +850,12 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       (await ctx.context.internalAdapter.findUserByEmail(email)) as MaybeWithAccounts | null
     );
     if (existingUser) {
-      throw APIError.from("CONFLICT", INVITE_ERROR_CODES.USER_ALREADY_EXISTS);
+      // Do not confirm the account's existence to an unauthenticated
+      // caller. Send them through sign-in; a signed-in redeem activates.
+      return ctx.json({
+        action: "SIGN_IN_REQUIRED" as const,
+        callbackURL: buildInviteUrl(ctx, body.token, invite.type)
+      });
     }
     const claimed = await claimUse(ctx, invite);
     if (!claimed) {
@@ -1043,15 +1086,17 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
                   if (!context) return;
                   const user = await context.context.internalAdapter.findUserById(account.userId);
                   if (!user || user.emailVerified) return;
-                  const pending = await context.context.adapter.findOne<Invite>({
+                  // Same scope as the password-reset guard: any non-accepted
+                  // invite. A cancelled invite leaves an inert pre-created
+                  // user behind; linking must stay blocked for it too.
+                  const invites = await context.context.adapter.findMany<Invite>({
                     model: "invite",
                     where: [
                       { field: "email", value: user.email.toLowerCase() },
-                      { field: "status", value: "pending" },
                       { field: "mode", value: "invite-only" }
                     ]
                   });
-                  if (pending) {
+                  if (invites.some((i) => i.status !== "accepted")) {
                     throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.INVITATION_REQUIRED);
                   }
                 }
@@ -1104,15 +1149,54 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })
         },
         {
-          // A disabled org rejects org plugin traffic targeting it.
+          // A disabled org rejects org plugin traffic targeting it,
+          // whether addressed by id, slug, invitationId, or implicitly
+          // through the session's active organization.
           matcher: (ctx) => !!ctx.path?.startsWith("/organization"),
           handler: createAuthMiddleware(async (ctx) => {
             if (!orgEnabled()) return;
-            const body = ctx.body as { organizationId?: unknown } | undefined;
-            const query = ctx.query as { organizationId?: unknown } | undefined;
-            const orgId =
-              (typeof body?.organizationId === "string" ? body.organizationId : undefined) ??
-              (typeof query?.organizationId === "string" ? query.organizationId : undefined);
+            const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+            const body = ctx.body as Record<string, unknown> | undefined;
+            const query = ctx.query as Record<string, unknown> | undefined;
+
+            let orgId = str(body?.organizationId) ?? str(query?.organizationId);
+            const slug = str(body?.organizationSlug) ?? str(query?.organizationSlug);
+            if (!orgId && slug) {
+              const bySlug = await ctx.context.adapter
+                .findOne<OrganizationRecord>({
+                  model: "organization",
+                  where: [{ field: "slug", value: slug }]
+                })
+                .catch(() => null);
+              orgId = bySlug?.id;
+            }
+            const invitationId = str(body?.invitationId) ?? str(query?.invitationId);
+            if (!orgId && invitationId) {
+              const invitation = await ctx.context.adapter
+                .findOne<{ organizationId?: string }>({
+                  model: "invitation",
+                  where: [{ field: "id", value: invitationId }]
+                })
+                .catch(() => null);
+              orgId = invitation?.organizationId;
+            }
+            if (!orgId) {
+              // No explicit target: most org endpoints then act on the
+              // active organization. Endpoints that never do are exempt,
+              // or a disabled active org would lock users out of
+              // listing, creating, and switching orgs.
+              const implicit = ![
+                "/organization/list",
+                "/organization/create",
+                "/organization/set-active"
+              ].includes(ctx.path ?? "");
+              if (!implicit) return;
+              const session = await getSessionFromCtx(ctx).catch(() => null);
+              orgId = str(
+                (session?.session as { activeOrganizationId?: unknown } | undefined)
+                  ?.activeOrganizationId
+              );
+            }
             if (!orgId) return;
             const org = await findOrg(ctx, orgId);
             if (org?.disabledAt) {
@@ -1330,11 +1414,15 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           if (email) {
             // Pending rows lock the email even past expiresAt.
             // The admin must delete stale invites first.
+            // org-join checks within its own org only: the same email may
+            // be invited to several orgs, and an org inviter must not be
+            // able to probe for pending invites elsewhere in the app.
             const existing = await ctx.context.adapter.findOne<Invite>({
               model: "invite",
               where: [
                 { field: "email", value: email },
-                { field: "status", value: "pending" }
+                { field: "status", value: "pending" },
+                ...(kind === "org-join" ? [{ field: "organizationId", value: org!.id }] : [])
               ]
             });
             if (existing) {
@@ -1361,13 +1449,19 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
           let preCreatedUserId: string | null = null;
           if (mode === "invite-only" && type === "private" && email && !emailHasUser) {
-            const created = await ctx.context.internalAdapter.createUser({
-              email,
-              name: ctx.body.name ?? "",
-              emailVerified: false,
-              role
-            });
-            preCreatedUserId = created.id;
+            try {
+              const created = await ctx.context.internalAdapter.createUser({
+                email,
+                name: ctx.body.name ?? "",
+                emailVerified: false,
+                role
+              });
+              preCreatedUserId = created.id;
+            } catch {
+              // Unique-email race: a concurrent create pre-created this
+              // user between our conflict check and now.
+              throw APIError.from("CONFLICT", INVITE_ERROR_CODES.EMAIL_ALREADY_INVITED);
+            }
           }
 
           const token = generateRandomString(32);
@@ -1967,56 +2061,49 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           // Ban first while member rows still exist.
           const bannedMembers = ctx.body.banMembers ? await banOrgMembers(ctx, org.id) : 0;
 
-          const teams = await ctx.context.adapter
-            .findMany<TeamRecord>({
-              model: "team",
-              where: [{ field: "organizationId", value: org.id }],
-              limit: 100000
-            })
-            .catch(() => [] as TeamRecord[]);
-          if (teams.length > 0) {
-            await ctx.context.adapter
-              .deleteMany({
-                model: "teamMember",
-                where: [
-                  {
-                    field: "teamId",
-                    value: teams.map((t) => t.id),
-                    operator: "in"
-                  }
-                ]
-              })
-              .catch(() => {});
-            await ctx.context.adapter
-              .deleteMany({
+          // Drain loops: fetch a page, delete it, repeat. Each pass removes
+          // what it read, so the query converges and no IN clause exceeds
+          // the page size.
+          try {
+            for (;;) {
+              const teams = await ctx.context.adapter.findMany<TeamRecord>({
                 model: "team",
-                where: [{ field: "organizationId", value: org.id }]
-              })
-              .catch(() => {});
+                where: [{ field: "organizationId", value: org.id }],
+                limit: DB_PAGE
+              });
+              if (teams.length === 0) break;
+              const teamIds = teams.map((t) => t.id);
+              await ctx.context.adapter.deleteMany({
+                model: "teamMember",
+                where: [{ field: "teamId", value: teamIds, operator: "in" }]
+              });
+              await ctx.context.adapter.deleteMany({
+                model: "team",
+                where: [{ field: "id", value: teamIds, operator: "in" }]
+              });
+            }
+          } catch {
+            // Teams tables absent (org plugin without teams): nothing to do.
           }
           await ctx.context.adapter.deleteMany({
             model: "member",
             where: [{ field: "organizationId", value: org.id }]
           });
-          const invites = await ctx.context.adapter.findMany<Invite>({
-            model: "invite",
-            where: [{ field: "organizationId", value: org.id }],
-            limit: 100000
-          });
-          if (invites.length > 0) {
+          for (;;) {
+            const invites = await ctx.context.adapter.findMany<Invite>({
+              model: "invite",
+              where: [{ field: "organizationId", value: org.id }],
+              limit: DB_PAGE
+            });
+            if (invites.length === 0) break;
+            const inviteIds = invites.map((i) => i.id);
             await ctx.context.adapter.deleteMany({
               model: "inviteUse",
-              where: [
-                {
-                  field: "inviteId",
-                  value: invites.map((i) => i.id),
-                  operator: "in"
-                }
-              ]
+              where: [{ field: "inviteId", value: inviteIds, operator: "in" }]
             });
             await ctx.context.adapter.deleteMany({
               model: "invite",
-              where: [{ field: "organizationId", value: org.id }]
+              where: [{ field: "id", value: inviteIds, operator: "in" }]
             });
           }
           // The org plugin's own invitation table, when present.
@@ -2046,22 +2133,80 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         "/invite/cleanup-expired",
         {
           method: "POST",
-          metadata: { SERVER_ONLY: true }
+          metadata: { SERVER_ONLY: true },
+          body: z
+            .object({
+              batchSize: z.number().int().positive().max(5000).optional()
+            })
+            .optional()
         },
         async (ctx) => {
-          const expired = await ctx.context.adapter.findMany<Invite>({
-            model: "invite",
-            where: [
-              { field: "status", value: "pending" },
-              { field: "expiresAt", value: new Date(), operator: "lt" }
-            ]
-          });
+          // Batched so the table size never dictates this request's memory
+          // or duration: each pass fetches one batch, deletes it with
+          // set-based queries, and repeats until drained. Invites with
+          // recorded uses are excluded up front and stay as audit records.
+          const batch = ctx.body?.batchSize ?? 500;
           let deleted = 0;
-          for (const invite of expired) {
-            if (invite.useCount > 0) continue;
-            await deleteInviteAndInertUser(ctx, invite);
-            await opts.onInviteDeleted?.({ invite, admin: null });
-            deleted++;
+          for (;;) {
+            const expired = await ctx.context.adapter.findMany<Invite>({
+              model: "invite",
+              where: [
+                { field: "status", value: "pending" },
+                { field: "expiresAt", value: new Date(), operator: "lt" },
+                { field: "useCount", value: 0 }
+              ],
+              limit: batch
+            });
+            if (expired.length === 0) break;
+
+            // Pre-created users go too, but only while inert: unverified
+            // and holding no accounts.
+            const shellIds = expired.map((i) => i.preCreatedUserId).filter((v): v is string => !!v);
+            if (shellIds.length > 0) {
+              const users = await ctx.context.adapter.findMany<{
+                id: string;
+                emailVerified: boolean;
+              }>({
+                model: "user",
+                where: [{ field: "id", value: shellIds, operator: "in" }],
+                limit: shellIds.length
+              });
+              const unverified = users.filter((u) => !u.emailVerified).map((u) => u.id);
+              if (unverified.length > 0) {
+                const accounts = await ctx.context.adapter.findMany<{ userId: string }>({
+                  model: "account",
+                  where: [{ field: "userId", value: unverified, operator: "in" }],
+                  limit: 100000
+                });
+                const linked = new Set(accounts.map((a) => a.userId));
+                const inert = unverified.filter((id) => !linked.has(id));
+                if (inert.length > 0) {
+                  await ctx.context.adapter.deleteMany({
+                    model: "session",
+                    where: [{ field: "userId", value: inert, operator: "in" }]
+                  });
+                  await ctx.context.adapter.deleteMany({
+                    model: "user",
+                    where: [{ field: "id", value: inert, operator: "in" }]
+                  });
+                }
+              }
+            }
+
+            const ids = expired.map((i) => i.id);
+            await ctx.context.adapter.deleteMany({
+              model: "inviteUse",
+              where: [{ field: "inviteId", value: ids, operator: "in" }]
+            });
+            await ctx.context.adapter.deleteMany({
+              model: "invite",
+              where: [{ field: "id", value: ids, operator: "in" }]
+            });
+            for (const invite of expired) {
+              await opts.onInviteDeleted?.({ invite, admin: null });
+            }
+            deleted += expired.length;
+            if (expired.length < batch) break;
           }
           return ctx.json({ deleted });
         }
