@@ -1,0 +1,67 @@
+// Example Prisma models for @octopi-ai/better-enrollment.
+//
+// These are the two tables the plugin adds on top of your existing Better Auth
+// schema (user, account, session, verification, plus the admin plugin's fields
+// on user), and the two columns it adds to the organization plugin's
+// Organization model when org features are enabled. Run
+// `npx @better-auth/cli generate` to produce the authoritative schema for your
+// setup; this file is a reference for what the plugin needs.
+//
+// Deliberately NO foreign keys on organizationId, teamId, or createdByUserId:
+// accepted invites are permanent audit records and must survive the deletion
+// of their org, team, or inviter (inviterName/inviterEmail are denormalized
+// for exactly that reason).
+
+model Invite {
+  id               String    @id @default(cuid())
+  type             String // "private" | "public"
+  kind             String    @default("app") // "app" | "org-join" | "org-create"
+  email            String?
+  name             String?
+  role             String
+  tokenHash        String    @unique
+  status           String    @default("pending") // "pending" | "accepted" | "cancelled"
+  mode             String // "invite-only" | "open"
+  organizationId   String? // org-join: the org this invite grants membership in
+  organizationRole String? // org-join: role written to member.role on redeem
+  teamId           String? // org-join: optional team joined on redeem
+  presetSeatLimit  Int? // org-create: seat limit applied to the founded org
+  preCreatedUserId String?
+  createdByUserId  String?
+  inviterName      String
+  inviterEmail     String
+  expiresAt        DateTime?
+  maxUses          Int?
+  useCount         Int       @default(0)
+  revokedAt        DateTime?
+  revokedByUserId  String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  uses             InviteUse[]
+
+  @@index([email])
+  @@index([organizationId])
+}
+
+model InviteUse {
+  id           String   @id @default(cuid())
+  inviteId     String
+  invite       Invite   @relation(fields: [inviteId], references: [id], onDelete: Cascade)
+  usedByUserId String
+  inviteeEmail String
+  usedAt       DateTime @default(now())
+
+  @@index([inviteId])
+}
+
+// With org features enabled, the plugin extends the organization plugin's
+// Organization model with two columns (shown partially; keep the org plugin's
+// real fields: name, slug, logo, metadata, members, ...).
+model Organization {
+  id         String    @id @default(cuid())
+  name       String
+  slug       String?   @unique
+  seatLimit  Int? // plugin: per-org seat cap, admin-settable (null = unlimited)
+  disabledAt DateTime? // plugin: set while the org is disabled by an admin
+  // ...the org plugin's other fields and relations...
+}

@@ -1,0 +1,2071 @@
+import type {
+  AuthContext,
+  BetterAuthOptions,
+  BetterAuthPlugin,
+  GenericEndpointContext,
+  User
+} from "better-auth";
+import {
+  APIError,
+  createAuthEndpoint,
+  createAuthMiddleware,
+  getSessionFromCtx,
+  sessionMiddleware
+} from "better-auth/api";
+import { setSessionCookie } from "better-auth/cookies";
+import { generateRandomString } from "better-auth/crypto";
+import * as z from "zod";
+import { buildSchema } from "./schema";
+import {
+  INVITE_ERROR_CODES,
+  type BetterEnrollmentOptions,
+  type Invite,
+  type InviteKind,
+  type InviteMode,
+  type InviteType,
+  type InviteUse,
+  type MemberRecord,
+  type OrganizationRecord,
+  type TeamRecord
+} from "./types";
+import {
+  deriveStatus,
+  isExpired,
+  maskEmail,
+  mergeRoles,
+  reservedSeats,
+  splitRoles,
+  storedTokenValue
+} from "./utils";
+
+export * from "./types";
+export { roleGate } from "./utils";
+
+const DEFAULT_EXPIRES_IN = 60 * 60 * 24 * 7;
+
+type SignupPath = {
+  name: string;
+  open: boolean;
+  conditional?: boolean;
+};
+
+type MaybeWithAccounts = User | { user: User; accounts: { providerId: string }[] };
+
+type BannableUser = User & { role?: string | null; banned?: boolean | null };
+
+type RedeemBody = {
+  token: string;
+  password?: string;
+  name?: string;
+  email?: string;
+  organizationName?: string;
+  organizationSlug?: string;
+};
+
+type OrgPrecheck = {
+  org?: OrganizationRecord | null;
+  orgInput?: { name: string; slug: string };
+};
+
+function unwrapUser(result: MaybeWithAccounts | null): User | null {
+  if (!result) return null;
+  return "user" in result ? result.user : result;
+}
+
+function detectSignupPaths(options: BetterAuthOptions): SignupPath[] {
+  const paths: SignupPath[] = [];
+  if (options.emailAndPassword?.enabled) {
+    paths.push({
+      name: "email-password",
+      open: !options.emailAndPassword.disableSignUp
+    });
+  }
+  for (const [name, provider] of Object.entries(options.socialProviders ?? {})) {
+    if (!provider || (provider as { enabled?: boolean }).enabled === false) continue;
+    const p = provider as {
+      disableSignUp?: boolean;
+      disableImplicitSignUp?: boolean;
+    };
+    if (p.disableSignUp) {
+      paths.push({ name, open: false });
+    } else if (p.disableImplicitSignUp) {
+      paths.push({ name, open: true, conditional: true });
+    } else {
+      paths.push({ name, open: true });
+    }
+  }
+  return paths;
+}
+
+function describePaths(paths: SignupPath[]): string {
+  return paths
+    .map(
+      (p) =>
+        `${p.name}: ${p.open ? (p.conditional ? "conditionally open (disableImplicitSignUp)" : "open") : "closed"}`
+    )
+    .join(", ");
+}
+
+export const betterEnrollment = (options: BetterEnrollmentOptions) => {
+  const opts = {
+    mode: "auto" as const,
+    allowOpenSignup: false,
+    defaultRole: "user",
+    expiresIn: DEFAULT_EXPIRES_IN,
+    publicExpiresIn: DEFAULT_EXPIRES_IN as number | null,
+    hashTokens: true,
+    autoVerifyPublicInviteEmail: false,
+    exposeEmailOnGet: false,
+    adminRoles: ["admin"],
+    adminUserIds: [] as string[],
+    ...options
+  };
+  const orgOpts = opts.organization;
+
+  const state = {
+    mode: (opts.mode === "auto" ? null : opts.mode) as InviteMode | null,
+    orgPluginPresent: false
+  };
+  const getMode = (): InviteMode => {
+    if (!state.mode) {
+      throw new APIError("INTERNAL_SERVER_ERROR", {
+        message: "better-enrollment: mode not resolved; plugin init did not run"
+      });
+    }
+    return state.mode;
+  };
+  const orgEnabled = () => !!orgOpts && state.orgPluginPresent;
+
+  async function findInviteByToken(
+    ctx: GenericEndpointContext,
+    token: string
+  ): Promise<Invite | null> {
+    const tokenHash = await storedTokenValue(token, opts.hashTokens);
+    return await ctx.context.adapter.findOne<Invite>({
+      model: "invite",
+      where: [{ field: "tokenHash", value: tokenHash }]
+    });
+  }
+
+  function buildInviteUrl(ctx: GenericEndpointContext, token: string, type: InviteType): string {
+    if (opts.buildInviteUrl) {
+      return opts.buildInviteUrl({ token, type, mode: getMode() });
+    }
+    const origin = new URL(ctx.context.baseURL).origin;
+    return `${origin}/invite?token=${encodeURIComponent(token)}`;
+  }
+
+  async function getAuthUser(ctx: GenericEndpointContext): Promise<BannableUser> {
+    const session = ctx.context.session;
+    if (!session) {
+      throw new APIError("UNAUTHORIZED");
+    }
+    // Re-read from DB: never trust the cookie cache for a privilege gate.
+    const user = (await ctx.context.internalAdapter.findUserById(
+      session.user.id
+    )) as BannableUser | null;
+    if (!user) {
+      throw new APIError("UNAUTHORIZED");
+    }
+    return user;
+  }
+
+  async function isInviteAdmin(user: BannableUser): Promise<boolean> {
+    if (opts.canManageInvites) {
+      return await opts.canManageInvites(user);
+    }
+    return (
+      opts.adminUserIds.includes(user.id) ||
+      splitRoles(user.role).some((r) => opts.adminRoles.includes(r))
+    );
+  }
+
+  async function requireInviteAdmin(ctx: GenericEndpointContext): Promise<BannableUser> {
+    const user = await getAuthUser(ctx);
+    if (!(await isInviteAdmin(user))) {
+      throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
+    }
+    return user;
+  }
+
+  async function assertUsable(invite: Invite | null): Promise<Invite> {
+    if (!invite) {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+    }
+    if (invite.status === "cancelled") {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_REVOKED);
+    }
+    if (invite.status === "accepted") {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_ALREADY_USED);
+    }
+    if (isExpired(invite)) {
+      await opts.onInviteExpired?.({ invite });
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_EXPIRED);
+    }
+    return invite;
+  }
+
+  async function resolveRole(invite: Invite): Promise<string> {
+    if (!opts.validRoles || opts.validRoles.includes(invite.role)) {
+      return invite.role;
+    }
+    if (opts.fallbackRole) return opts.fallbackRole;
+    await opts.onInvalidRole?.({ invite, role: invite.role });
+    throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.ROLE_NO_LONGER_VALID);
+  }
+
+  // Atomic claim: the where clause doubles as guard, losers get null.
+  async function claimUse(ctx: GenericEndpointContext, invite: Invite): Promise<Invite | null> {
+    const singleUse = invite.type === "private" || invite.maxUses === 1;
+    return await ctx.context.adapter.incrementOne<Invite>({
+      model: "invite",
+      where: [
+        { field: "id", value: invite.id },
+        { field: "status", value: "pending" },
+        ...(invite.maxUses != null
+          ? [
+              {
+                field: "useCount",
+                value: invite.maxUses,
+                operator: "lt" as const
+              }
+            ]
+          : [])
+      ],
+      increment: { useCount: 1 },
+      set: {
+        updatedAt: new Date(),
+        ...(singleUse ? { status: "accepted" } : {})
+      }
+    });
+  }
+
+  async function rollbackClaim(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    claimed: Invite
+  ): Promise<void> {
+    try {
+      await ctx.context.adapter.incrementOne({
+        model: "invite",
+        where: [
+          { field: "id", value: invite.id },
+          { field: "status", value: claimed.status },
+          { field: "useCount", value: claimed.useCount }
+        ],
+        increment: { useCount: -1 },
+        set: { status: "pending", updatedAt: new Date() }
+      });
+    } catch (e) {
+      ctx.context.logger.error(`better-enrollment: claim rollback failed: ${String(e)}`);
+    }
+  }
+
+  async function recordUse(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    userId: string,
+    email: string
+  ): Promise<void> {
+    await ctx.context.adapter.create<Omit<InviteUse, "id">>({
+      model: "inviteUse",
+      data: {
+        inviteId: invite.id,
+        usedByUserId: userId,
+        inviteeEmail: email.toLowerCase(),
+        usedAt: new Date()
+      }
+    });
+  }
+
+  // Public invites flip to accepted only once the cap is reached.
+  async function settlePublicStatus(ctx: GenericEndpointContext, claimed: Invite): Promise<void> {
+    if (claimed.maxUses != null && claimed.useCount >= claimed.maxUses) {
+      await ctx.context.adapter.update({
+        model: "invite",
+        where: [
+          { field: "id", value: claimed.id },
+          { field: "status", value: "pending" }
+        ],
+        update: { status: "accepted", updatedAt: new Date() }
+      });
+    }
+  }
+
+  // Deletes an invite plus its pre-created user while that user is inert.
+  async function deleteInviteAndInertUser(
+    ctx: GenericEndpointContext,
+    invite: Invite
+  ): Promise<void> {
+    if (invite.preCreatedUserId) {
+      const user = await ctx.context.internalAdapter.findUserById(invite.preCreatedUserId);
+      if (user && !user.emailVerified) {
+        const accounts = await ctx.context.internalAdapter.findAccounts(user.id);
+        if (accounts.length === 0) {
+          await ctx.context.adapter.deleteMany({
+            model: "session",
+            where: [{ field: "userId", value: user.id }]
+          });
+          await ctx.context.adapter.delete({
+            model: "user",
+            where: [{ field: "id", value: user.id }]
+          });
+        }
+      }
+    }
+    await ctx.context.adapter.deleteMany({
+      model: "inviteUse",
+      where: [{ field: "inviteId", value: invite.id }]
+    });
+    await ctx.context.adapter.delete({
+      model: "invite",
+      where: [{ field: "id", value: invite.id }]
+    });
+  }
+
+  // ---------------------------------------------------------------- org
+
+  async function findOrg(
+    ctx: GenericEndpointContext,
+    organizationId: string
+  ): Promise<OrganizationRecord | null> {
+    return await ctx.context.adapter.findOne<OrganizationRecord>({
+      model: "organization",
+      where: [{ field: "id", value: organizationId }]
+    });
+  }
+
+  async function findMember(
+    ctx: GenericEndpointContext,
+    userId: string,
+    organizationId: string
+  ): Promise<MemberRecord | null> {
+    return await ctx.context.adapter.findOne<MemberRecord>({
+      model: "member",
+      where: [
+        { field: "userId", value: userId },
+        { field: "organizationId", value: organizationId }
+      ]
+    });
+  }
+
+  async function dynamicOrgRoles(
+    ctx: GenericEndpointContext,
+    organizationId: string
+  ): Promise<{ role: string; permission: unknown }[]> {
+    // The organizationRole table only exists with dynamic access control.
+    try {
+      return await ctx.context.adapter.findMany<{
+        role: string;
+        permission: unknown;
+      }>({
+        model: "organizationRole",
+        where: [{ field: "organizationId", value: organizationId }]
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  async function memberHasInvitePermission(
+    ctx: GenericEndpointContext,
+    member: MemberRecord,
+    action: "create" | "cancel"
+  ): Promise<boolean> {
+    const roles = splitRoles(member.role);
+    for (const name of roles) {
+      const configured = orgOpts?.roles?.[name];
+      if (configured?.authorize) {
+        try {
+          if (configured.authorize({ invitation: [action] }).success) {
+            return true;
+          }
+          continue;
+        } catch {
+          continue;
+        }
+      }
+      // Org plugin defaults: owner and admin hold invitation create/cancel.
+      if (name === "owner" || name === "admin") return true;
+    }
+    const dynamic = await dynamicOrgRoles(ctx, member.organizationId);
+    for (const row of dynamic) {
+      if (!roles.includes(row.role)) continue;
+      try {
+        const permission =
+          typeof row.permission === "string"
+            ? (JSON.parse(row.permission) as Record<string, string[]>)
+            : (row.permission as Record<string, string[]> | null);
+        if (permission?.invitation?.includes(action)) return true;
+      } catch {
+        // unreadable permission blob: treat as no grant
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Gate for org-join management. Unknown org and non-membership throw the
+   * identical FORBIDDEN so organization ids cannot be enumerated.
+   */
+  async function requireOrgInviteAccess(
+    ctx: GenericEndpointContext,
+    user: BannableUser,
+    organizationId: string,
+    action: "create" | "cancel"
+  ): Promise<{ org: OrganizationRecord; member: MemberRecord }> {
+    const org = await findOrg(ctx, organizationId);
+    const member = org ? await findMember(ctx, user.id, org.id) : null;
+    let allowed = false;
+    if (org && member) {
+      if (action === "create" && orgOpts?.canCreateOrgInvites) {
+        allowed = await orgOpts.canCreateOrgInvites(member, org);
+      } else {
+        allowed = await memberHasInvitePermission(ctx, member, action);
+      }
+    }
+    if (!org || !member || !allowed) {
+      throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.ORG_INVITE_NOT_ALLOWED);
+    }
+    return { org, member };
+  }
+
+  async function knownOrgRoles(
+    ctx: GenericEndpointContext,
+    organizationId: string
+  ): Promise<string[]> {
+    const base = orgOpts?.roles ? Object.keys(orgOpts.roles) : ["owner", "admin", "member"];
+    const dynamic = await dynamicOrgRoles(ctx, organizationId);
+    return [...new Set([...base, ...dynamic.map((r) => r.role)])];
+  }
+
+  async function seatLimitFor(
+    ctx: GenericEndpointContext,
+    org: OrganizationRecord
+  ): Promise<number | null> {
+    if (orgOpts?.resolveSeatLimit) {
+      const resolved = await orgOpts.resolveSeatLimit(org);
+      if (resolved !== undefined) return resolved;
+    }
+    if (org.seatLimit != null) return org.seatLimit;
+    return orgOpts?.defaultSeatLimit ?? null;
+  }
+
+  async function seatUsage(
+    ctx: GenericEndpointContext,
+    organizationId: string
+  ): Promise<{ members: number; reserved: number }> {
+    const members = await ctx.context.adapter.count({
+      model: "member",
+      where: [{ field: "organizationId", value: organizationId }]
+    });
+    const pending = await ctx.context.adapter.findMany<Invite>({
+      model: "invite",
+      where: [
+        { field: "organizationId", value: organizationId },
+        { field: "status", value: "pending" }
+      ],
+      limit: 100000
+    });
+    const now = new Date();
+    const reserved = pending.reduce((sum, i) => sum + reservedSeats(i, now), 0);
+    return { members, reserved };
+  }
+
+  function isBanned(user: unknown): boolean {
+    return (user as { banned?: boolean | null } | null)?.banned === true;
+  }
+
+  /**
+   * Redemption-time org preconditions, checked BEFORE the invite claim so
+   * failures are clean. State can change between create and accept.
+   */
+  async function assertOrgRedeemable(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    body: RedeemBody
+  ): Promise<OrgPrecheck> {
+    if (invite.kind === "org-join") {
+      if (!orgEnabled() || !invite.organizationId) {
+        throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+      }
+      const org = await findOrg(ctx, invite.organizationId);
+      if (!org) {
+        // Org gone: the invite died with it.
+        throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+      }
+      if (org.disabledAt) {
+        throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.ORG_DISABLED);
+      }
+      return { org };
+    }
+    if (invite.kind === "org-create") {
+      if (!orgEnabled()) {
+        throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+      }
+      const name = body.organizationName?.trim();
+      const slug = body.organizationSlug?.trim().toLowerCase();
+      if (!name || !slug) {
+        throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.ORG_INFO_REQUIRED);
+      }
+      const existing = await ctx.context.adapter.findOne<OrganizationRecord>({
+        model: "organization",
+        where: [{ field: "slug", value: slug }]
+      });
+      if (existing) {
+        throw APIError.from("CONFLICT", INVITE_ERROR_CODES.ORG_SLUG_TAKEN);
+      }
+      return { orgInput: { name, slug } };
+    }
+    return {};
+  }
+
+  async function resolveOrgRoleForRedeem(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    organizationId: string
+  ): Promise<string> {
+    const fallback = orgOpts?.defaultOrganizationRole ?? "member";
+    const requested = invite.organizationRole ?? fallback;
+    const known = await knownOrgRoles(ctx, organizationId);
+    // A role deleted between create and accept degrades to the default.
+    return known.includes(requested) ? requested : fallback;
+  }
+
+  /**
+   * Runs after the claim inside the redemption flow. Creates the member
+   * (and team membership) for org-join, or founds the org for org-create.
+   */
+  async function applyOrgEffects(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    user: User,
+    pre: OrgPrecheck
+  ): Promise<OrganizationRecord | null> {
+    if (invite.kind === "app") return null;
+    const now = new Date();
+
+    if (invite.kind === "org-create") {
+      if (!pre.orgInput) return null;
+      let org: OrganizationRecord;
+      try {
+        org = await ctx.context.adapter.create<Omit<OrganizationRecord, "id">, OrganizationRecord>({
+          model: "organization",
+          data: {
+            name: pre.orgInput.name,
+            slug: pre.orgInput.slug,
+            createdAt: now,
+            seatLimit: invite.presetSeatLimit ?? null,
+            disabledAt: null
+          }
+        });
+      } catch {
+        // Unique slug race between precheck and create.
+        throw APIError.from("CONFLICT", INVITE_ERROR_CODES.ORG_SLUG_TAKEN);
+      }
+      const member = await ctx.context.adapter.create<Omit<MemberRecord, "id">, MemberRecord>({
+        model: "member",
+        data: {
+          organizationId: org.id,
+          userId: user.id,
+          role: orgOpts?.orgCreateRole ?? "owner",
+          createdAt: now
+        }
+      });
+      await orgOpts?.onOrgMemberAdded?.({
+        organization: org,
+        member,
+        user,
+        invite,
+        teamAdded: false
+      });
+      return org;
+    }
+
+    // org-join
+    const org = pre.org ?? (await findOrg(ctx, invite.organizationId!));
+    if (!org) {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+    }
+    const existing = await findMember(ctx, user.id, org.id);
+    const orgRole = await resolveOrgRoleForRedeem(ctx, invite, org.id);
+    if (existing) {
+      // Already a member: merge org roles, consume no seat.
+      await ctx.context.adapter.update({
+        model: "member",
+        where: [{ field: "id", value: existing.id }],
+        update: { role: mergeRoles(existing.role, orgRole) }
+      });
+      return org;
+    }
+    const limit = await seatLimitFor(ctx, org);
+    if (limit != null) {
+      // Guards out-of-band member growth; invite flows are already
+      // bounded by creation-time reservations + the atomic claim.
+      const members = await ctx.context.adapter.count({
+        model: "member",
+        where: [{ field: "organizationId", value: org.id }]
+      });
+      if (members >= limit) {
+        await orgOpts?.onSeatLimitReached?.({ organization: org, invite });
+        throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.SEAT_LIMIT_REACHED);
+      }
+    }
+    const member = await ctx.context.adapter.create<Omit<MemberRecord, "id">, MemberRecord>({
+      model: "member",
+      data: {
+        organizationId: org.id,
+        userId: user.id,
+        role: orgRole,
+        createdAt: now
+      }
+    });
+    let teamAdded = false;
+    if (invite.teamId) {
+      // Team deleted since creation: join the org, skip the team.
+      const team = await ctx.context.adapter
+        .findOne<TeamRecord>({
+          model: "team",
+          where: [{ field: "id", value: invite.teamId }]
+        })
+        .catch(() => null);
+      if (team && team.organizationId === org.id) {
+        await ctx.context.adapter.create({
+          model: "teamMember",
+          data: {
+            teamId: invite.teamId,
+            userId: user.id,
+            createdAt: now
+          }
+        });
+        teamAdded = true;
+      }
+    }
+    await orgOpts?.onOrgMemberAdded?.({
+      organization: org,
+      member,
+      user,
+      invite,
+      teamAdded
+    });
+    return org;
+  }
+
+  async function setActiveOrganization(
+    ctx: GenericEndpointContext,
+    sessionToken: string,
+    organizationId: string
+  ): Promise<void> {
+    // internalAdapter.updateSession keeps secondary storage (Redis-style
+    // session stores) in sync; a raw adapter update would only touch the
+    // database row and never be seen by apps that read sessions from
+    // secondary storage.
+    try {
+      await ctx.context.internalAdapter.updateSession(sessionToken, {
+        activeOrganizationId: organizationId
+      });
+    } catch (e) {
+      ctx.context.logger.warn(`better-enrollment: could not set active organization: ${String(e)}`);
+    }
+  }
+
+  async function banOrgMembers(
+    ctx: GenericEndpointContext,
+    organizationId: string
+  ): Promise<number> {
+    const members = await ctx.context.adapter.findMany<MemberRecord>({
+      model: "member",
+      where: [{ field: "organizationId", value: organizationId }],
+      limit: 100000
+    });
+    const ids = [...new Set(members.map((m) => m.userId))];
+    if (ids.length === 0) return 0;
+    await ctx.context.adapter.updateMany({
+      model: "user",
+      where: [{ field: "id", value: ids, operator: "in" }],
+      update: {
+        banned: true,
+        banReason: "Organization suspended by administrator"
+      }
+    });
+    await ctx.context.adapter.deleteMany({
+      model: "session",
+      where: [{ field: "userId", value: ids, operator: "in" }]
+    });
+    return ids.length;
+  }
+
+  async function requireOrgFeatures(): Promise<void> {
+    if (!orgEnabled()) {
+      throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.ORG_FEATURES_DISABLED);
+    }
+  }
+
+  // ---------------------------------------------------------- redemption
+
+  async function acceptCore(ctx: GenericEndpointContext, body: RedeemBody) {
+    const invite = await assertUsable(await findInviteByToken(ctx, body.token));
+    const role = await resolveRole(invite);
+
+    if (!body.password) {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.PASSWORD_REQUIRED);
+    }
+    const { minPasswordLength, maxPasswordLength } = ctx.context.password.config;
+    if (body.password.length < minPasswordLength || body.password.length > maxPasswordLength) {
+      throw new APIError("BAD_REQUEST", {
+        message: `Password must be between ${minPasswordLength} and ${maxPasswordLength} characters`
+      });
+    }
+
+    const pre = await assertOrgRedeemable(ctx, invite, body);
+
+    if (invite.type === "private") {
+      const target = invite.preCreatedUserId
+        ? await ctx.context.internalAdapter.findUserById(invite.preCreatedUserId)
+        : unwrapUser(
+            (await ctx.context.internalAdapter.findUserByEmail(
+              invite.email!
+            )) as MaybeWithAccounts | null
+          );
+      if (!target) {
+        throw APIError.from("NOT_FOUND", INVITE_ERROR_CODES.PRE_CREATED_USER_MISSING);
+      }
+      if (isBanned(target)) {
+        throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.USER_BANNED);
+      }
+      const claimed = await claimUse(ctx, invite);
+      if (!claimed) {
+        throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_ALREADY_USED);
+      }
+      try {
+        const hash = await ctx.context.password.hash(body.password);
+        // Idempotent on retry: a prior attempt may have created the
+        // credential account before failing later in the flow.
+        const priorCredential = await ctx.context.adapter.findOne<{
+          id: string;
+        }>({
+          model: "account",
+          where: [
+            { field: "userId", value: target.id },
+            { field: "providerId", value: "credential" }
+          ]
+        });
+        if (priorCredential) {
+          await ctx.context.adapter.update({
+            model: "account",
+            where: [{ field: "id", value: priorCredential.id }],
+            update: { password: hash }
+          });
+        } else {
+          await ctx.context.internalAdapter.createAccount({
+            userId: target.id,
+            providerId: "credential",
+            accountId: target.id,
+            password: hash
+          });
+        }
+        const updated =
+          (await ctx.context.internalAdapter.updateUser(target.id, {
+            emailVerified: true,
+            role,
+            ...(body.name ? { name: body.name } : {})
+          })) ?? target;
+        const org = await applyOrgEffects(ctx, claimed, updated, pre);
+        await recordUse(ctx, invite, target.id, target.email);
+        const session = await ctx.context.internalAdapter.createSession(target.id);
+        if (org) {
+          await setActiveOrganization(ctx, session.token, org.id);
+        }
+        await setSessionCookie(ctx, {
+          session: (org ? { ...session, activeOrganizationId: org.id } : session) as typeof session,
+          user: updated
+        });
+        await opts.onInviteAccepted?.({ invite: claimed, user: updated });
+        return ctx.json({
+          token: session.token,
+          user: {
+            id: updated.id,
+            email: updated.email,
+            name: updated.name,
+            emailVerified: updated.emailVerified
+          },
+          organization: org ? { id: org.id, name: org.name, slug: org.slug } : null
+        });
+      } catch (e) {
+        await rollbackClaim(ctx, invite, {
+          ...invite,
+          status: "accepted",
+          useCount: invite.useCount + 1
+        });
+        throw e;
+      }
+    }
+
+    const email = body.email?.toLowerCase().trim();
+    if (!email) {
+      throw APIError.from(
+        "UNPROCESSABLE_ENTITY",
+        INVITE_ERROR_CODES.EMAIL_REQUIRED_FOR_PUBLIC_ACCEPT
+      );
+    }
+    const existingUser = unwrapUser(
+      (await ctx.context.internalAdapter.findUserByEmail(email)) as MaybeWithAccounts | null
+    );
+    if (existingUser) {
+      throw APIError.from("CONFLICT", INVITE_ERROR_CODES.USER_ALREADY_EXISTS);
+    }
+    const claimed = await claimUse(ctx, invite);
+    if (!claimed) {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_USES_EXHAUSTED);
+    }
+    let createdUserId: string | null = null;
+    try {
+      const user = await ctx.context.internalAdapter.createUser({
+        email,
+        name: body.name ?? "",
+        emailVerified: opts.autoVerifyPublicInviteEmail,
+        role
+      });
+      createdUserId = user.id;
+      const hash = await ctx.context.password.hash(body.password);
+      await ctx.context.internalAdapter.createAccount({
+        userId: user.id,
+        providerId: "credential",
+        accountId: user.id,
+        password: hash
+      });
+      const org = await applyOrgEffects(ctx, claimed, user, pre);
+      await recordUse(ctx, invite, user.id, email);
+      await settlePublicStatus(ctx, claimed);
+      const session = await ctx.context.internalAdapter.createSession(user.id);
+      if (org) {
+        await setActiveOrganization(ctx, session.token, org.id);
+      }
+      await setSessionCookie(ctx, {
+        session: (org ? { ...session, activeOrganizationId: org.id } : session) as typeof session,
+        user
+      });
+      await opts.onInviteAccepted?.({ invite: claimed, user });
+      return ctx.json({
+        token: session.token,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          emailVerified: user.emailVerified
+        },
+        organization: org ? { id: org.id, name: org.name, slug: org.slug } : null
+      });
+    } catch (e) {
+      // No adapter-agnostic transaction exists, so compensate: the user
+      // created in THIS attempt must not outlive a failed redemption, or
+      // the email would be locked while the invite stays pending.
+      if (createdUserId) {
+        try {
+          await ctx.context.adapter.deleteMany({
+            model: "account",
+            where: [{ field: "userId", value: createdUserId }]
+          });
+          await ctx.context.adapter.delete({
+            model: "user",
+            where: [{ field: "id", value: createdUserId }]
+          });
+        } catch (cleanupError) {
+          ctx.context.logger.warn(
+            `better-enrollment: failed to clean up user after failed redemption: ${String(cleanupError)}`
+          );
+        }
+      }
+      await rollbackClaim(ctx, invite, claimed);
+      throw e;
+    }
+  }
+
+  async function activateCore(ctx: GenericEndpointContext, body: RedeemBody) {
+    const invite = await assertUsable(await findInviteByToken(ctx, body.token));
+
+    const session = await getSessionFromCtx(ctx);
+    if (!session) {
+      // Stateless round-trip: the token in the URL is the only state.
+      return ctx.json({
+        action: "SIGN_IN_REQUIRED" as const,
+        callbackURL: buildInviteUrl(ctx, body.token, invite.type)
+      });
+    }
+    if (isBanned(session.user)) {
+      throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.USER_BANNED);
+    }
+
+    if (invite.type === "private") {
+      if (session.user.email.toLowerCase() !== invite.email?.toLowerCase()) {
+        throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.EMAIL_MISMATCH);
+      }
+      if (!session.user.emailVerified) {
+        throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.EMAIL_NOT_VERIFIED);
+      }
+    }
+
+    // Re-activation by the same user is idempotent.
+    const priorUse = await ctx.context.adapter.findOne<InviteUse>({
+      model: "inviteUse",
+      where: [
+        { field: "inviteId", value: invite.id },
+        { field: "usedByUserId", value: session.user.id }
+      ]
+    });
+    if (priorUse) {
+      return ctx.json({
+        action: "ACCEPTED" as const,
+        role: (session.user as { role?: string | null }).role ?? null,
+        organization: null
+      });
+    }
+
+    const role = await resolveRole(invite);
+    const pre = await assertOrgRedeemable(ctx, invite, body);
+    const claimed = await claimUse(ctx, invite);
+    if (!claimed) {
+      throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_USES_EXHAUSTED);
+    }
+    try {
+      const current = (await ctx.context.internalAdapter.findUserById(
+        session.user.id
+      )) as BannableUser | null;
+      const merged = mergeRoles(current?.role, role);
+      const updated = await ctx.context.internalAdapter.updateUser(session.user.id, {
+        role: merged
+      });
+      const org = await applyOrgEffects(ctx, claimed, updated ?? session.user, pre);
+      if (org) {
+        await setActiveOrganization(ctx, session.session.token, org.id);
+      }
+      await recordUse(ctx, invite, session.user.id, session.user.email);
+      await settlePublicStatus(ctx, claimed);
+      await opts.onInviteAccepted?.({
+        invite: claimed,
+        user: updated ?? session.user
+      });
+      return ctx.json({
+        action: "ACCEPTED" as const,
+        role: merged,
+        organization: org ? { id: org.id, name: org.name, slug: org.slug } : null
+      });
+    } catch (e) {
+      await rollbackClaim(ctx, invite, claimed);
+      throw e;
+    }
+  }
+
+  // -------------------------------------------------------------- plugin
+
+  return {
+    id: "better-enrollment",
+    schema: buildSchema(!!orgOpts),
+    $ERROR_CODES: INVITE_ERROR_CODES,
+
+    init(ctx: AuthContext) {
+      const paths = detectSignupPaths(ctx.options);
+      const openPaths = paths.filter((p) => p.open);
+      const closedPaths = paths.filter((p) => !p.open);
+
+      if (opts.mode === "auto") {
+        if (paths.length === 0) {
+          throw new Error(
+            'better-enrollment: no sign-up paths detected. Set mode: "invite-only" or "open" explicitly.'
+          );
+        }
+        if (openPaths.length === 0) {
+          state.mode = "invite-only";
+        } else if (closedPaths.length === 0) {
+          state.mode = "open";
+        } else {
+          throw new Error(
+            `better-enrollment: mixed sign-up configuration (${describePaths(paths)}). Set mode explicitly: "invite-only" (with allowOpenSignup: true if intentional) or "open".`
+          );
+        }
+        ctx.logger.info(
+          `better-enrollment: mode "${state.mode}" auto-detected (${describePaths(paths)}). Sign-up paths from other plugins are not detectable; set mode explicitly if you use any.`
+        );
+      } else {
+        state.mode = opts.mode;
+        if (opts.mode === "invite-only" && openPaths.length > 0) {
+          const msg = `better-enrollment: mode is "invite-only" but sign-up is open on: ${describePaths(openPaths)}. The invite guarantee is per-email only; anyone else can sign up through the open paths.`;
+          if (opts.allowOpenSignup) {
+            ctx.logger.warn(msg);
+          } else {
+            throw new Error(
+              `${msg} Close those paths, or set allowOpenSignup: true if intentional.`
+            );
+          }
+        }
+      }
+
+      const orgPlugin = ctx.options.plugins?.find((p) => p.id === "organization");
+      state.orgPluginPresent = !!orgPlugin;
+      if (orgOpts && !orgPlugin) {
+        throw new Error(
+          "better-enrollment: organization options are set but the organization plugin is not registered. Add organization() to your plugins or remove the organization block."
+        );
+      }
+      if (!orgOpts && orgPlugin) {
+        ctx.logger.info(
+          "better-enrollment: organization plugin detected but org invite features are off. Pass organization: {} to enable them."
+        );
+      }
+
+      // Roles are stored on user.role. Without that field the invited role
+      // has nowhere to land and the default admin gate matches nobody.
+      const userFields = (
+        ctx.tables as Record<string, { fields?: Record<string, unknown> }> | undefined
+      )?.user?.fields;
+      const hasRoleField = !!userFields?.role || !!ctx.options.user?.additionalFields?.role;
+      if (!hasRoleField) {
+        ctx.logger.warn(
+          "better-enrollment: the user model has no `role` field. Invited roles cannot be stored, and the default adminRoles gate will match nobody. Register the admin plugin, or add a string `role` field via user.additionalFields, or gate invite management with adminUserIds / canManageInvites instead."
+        );
+      }
+
+      if (!opts.validRoles) {
+        ctx.logger.warn(
+          "better-enrollment: no validRoles configured; invite roles are not validated."
+        );
+      }
+
+      return {
+        options: {
+          databaseHooks: {
+            account: {
+              create: {
+                // Blocks OAuth linking while an invite-only invite is pending.
+                before: async (account, context) => {
+                  if (state.mode !== "invite-only") return;
+                  if (account.providerId === "credential") return;
+                  if (!context) return;
+                  const user = await context.context.internalAdapter.findUserById(account.userId);
+                  if (!user || user.emailVerified) return;
+                  const pending = await context.context.adapter.findOne<Invite>({
+                    model: "invite",
+                    where: [
+                      { field: "email", value: user.email.toLowerCase() },
+                      { field: "status", value: "pending" },
+                      { field: "mode", value: "invite-only" }
+                    ]
+                  });
+                  if (pending) {
+                    throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.INVITATION_REQUIRED);
+                  }
+                }
+              }
+            }
+          }
+        } satisfies Partial<BetterAuthOptions>
+      };
+    },
+
+    hooks: {
+      before: [
+        {
+          matcher: (ctx) =>
+            ctx.path === "/request-password-reset" || ctx.path === "/forget-password",
+          handler: createAuthMiddleware(async (ctx) => {
+            if (state.mode !== "invite-only") return;
+            const email = (ctx.body as { email?: string } | undefined)?.email?.toLowerCase().trim();
+            if (!email) return;
+            const invites = await ctx.context.adapter.findMany<Invite>({
+              model: "invite",
+              where: [
+                { field: "email", value: email },
+                { field: "mode", value: "invite-only" }
+              ]
+            });
+            if (!invites.some((i) => i.status !== "accepted")) return;
+            const found = (await ctx.context.internalAdapter.findUserByEmail(email, {
+              includeAccounts: true
+            })) as MaybeWithAccounts | null;
+            const hasCredential =
+              found && "accounts" in found
+                ? found.accounts.some((a) => a.providerId === "credential")
+                : false;
+            if (unwrapUser(found) && !hasCredential) {
+              // Core resetPassword CREATES a credential account when none
+              // exists (invite bypass). Reply with core's exact
+              // silent-success body: no reset, no oracle.
+              return new Response(
+                JSON.stringify({
+                  status: true,
+                  message: "If this email exists in our system, check your email for the reset link"
+                }),
+                {
+                  status: 200,
+                  headers: { "content-type": "application/json" }
+                }
+              );
+            }
+          })
+        },
+        {
+          // A disabled org rejects org plugin traffic targeting it.
+          matcher: (ctx) => !!ctx.path?.startsWith("/organization"),
+          handler: createAuthMiddleware(async (ctx) => {
+            if (!orgEnabled()) return;
+            const body = ctx.body as { organizationId?: unknown } | undefined;
+            const query = ctx.query as { organizationId?: unknown } | undefined;
+            const orgId =
+              (typeof body?.organizationId === "string" ? body.organizationId : undefined) ??
+              (typeof query?.organizationId === "string" ? query.organizationId : undefined);
+            if (!orgId) return;
+            const org = await findOrg(ctx, orgId);
+            if (org?.disabledAt) {
+              throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.ORG_DISABLED);
+            }
+          })
+        }
+      ],
+      after: [
+        {
+          // Admin plugin ban: a banned inviter's pending invites die.
+          matcher: (ctx) => ctx.path === "/admin/ban-user",
+          handler: createAuthMiddleware(async (ctx) => {
+            if (orgOpts?.revokeInvitesOnInviterBan === false) return;
+            if (ctx.context.returned instanceof APIError) return;
+            const userId = (ctx.body as { userId?: string } | undefined)?.userId;
+            if (!userId) return;
+            await ctx.context.adapter.updateMany({
+              model: "invite",
+              where: [
+                { field: "createdByUserId", value: userId },
+                { field: "status", value: "pending" }
+              ],
+              update: {
+                status: "cancelled",
+                revokedAt: new Date(),
+                updatedAt: new Date()
+              }
+            });
+          })
+        },
+        {
+          // Admin plugin removeUser: pending invites go with the inviter;
+          // accepted invites survive via denormalized inviter fields.
+          matcher: (ctx) => ctx.path === "/admin/remove-user",
+          handler: createAuthMiddleware(async (ctx) => {
+            if (ctx.context.returned instanceof APIError) return;
+            const userId = (ctx.body as { userId?: string } | undefined)?.userId;
+            if (!userId) return;
+            const pending = await ctx.context.adapter.findMany<Invite>({
+              model: "invite",
+              where: [
+                { field: "createdByUserId", value: userId },
+                { field: "status", value: "pending" }
+              ]
+            });
+            for (const invite of pending) {
+              await deleteInviteAndInertUser(ctx, invite);
+            }
+          })
+        }
+      ]
+    },
+
+    rateLimit: [
+      {
+        pathMatcher: (path) =>
+          path === "/invite/accept" || path === "/invite/activate" || path === "/invite/redeem",
+        window: 60,
+        max: 5
+      },
+      {
+        pathMatcher: (path) => path === "/invite/get" || path === "/invite/check-slug",
+        window: 60,
+        max: 10
+      }
+    ],
+
+    endpoints: {
+      createInvite: createAuthEndpoint(
+        "/invite/create",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            type: z.enum(["private", "public"]).default("private"),
+            kind: z.enum(["app", "org-join", "org-create"]).default("app"),
+            email: z.email().optional(),
+            name: z.string().max(200).optional(),
+            role: z.string().max(100).optional(),
+            expiresIn: z.number().int().positive().optional(),
+            maxUses: z.number().int().positive().nullable().optional(),
+            organizationId: z.string().max(200).optional(),
+            organizationRole: z.string().max(100).optional(),
+            teamId: z.string().max(200).optional(),
+            presetSeatLimit: z.number().int().positive().optional()
+          })
+        },
+        async (ctx) => {
+          const mode = getMode();
+          const kind: InviteKind = ctx.body.kind;
+          const type = ctx.body.type;
+          // The app-level role is an admin-only field. org-join creators
+          // are gated by org permission, not app adminship, so honoring
+          // their role would let any org inviter mint app admins.
+          if (kind === "org-join" && ctx.body.role != null) {
+            throw APIError.from(
+              "UNPROCESSABLE_ENTITY",
+              INVITE_ERROR_CODES.ROLE_NOT_ALLOWED_FOR_ORG_JOIN
+            );
+          }
+          const role = ctx.body.role ?? opts.defaultRole;
+          if (opts.validRoles && !opts.validRoles.includes(role)) {
+            throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.INVALID_ROLE);
+          }
+
+          let email: string | null = null;
+          let maxUses: number | null;
+          if (type === "private") {
+            if (!ctx.body.email) {
+              throw APIError.from(
+                "UNPROCESSABLE_ENTITY",
+                INVITE_ERROR_CODES.EMAIL_REQUIRED_FOR_PRIVATE_INVITE
+              );
+            }
+            if (ctx.body.maxUses != null && ctx.body.maxUses !== 1) {
+              throw APIError.from(
+                "UNPROCESSABLE_ENTITY",
+                INVITE_ERROR_CODES.MAX_USES_INVALID_FOR_PRIVATE
+              );
+            }
+            email = ctx.body.email.toLowerCase().trim();
+            maxUses = 1;
+          } else {
+            maxUses = ctx.body.maxUses === undefined ? null : ctx.body.maxUses;
+          }
+
+          // Gate by kind. Org sovereignty: only the org invites into
+          // itself; only app admins mint app and org-create invites.
+          let creator: BannableUser;
+          let org: OrganizationRecord | null = null;
+          let organizationRole: string | null = null;
+          if (kind === "org-join") {
+            await requireOrgFeatures();
+            if (!ctx.body.organizationId) {
+              throw APIError.from(
+                "UNPROCESSABLE_ENTITY",
+                INVITE_ERROR_CODES.ORGANIZATION_ID_REQUIRED
+              );
+            }
+            if (ctx.body.presetSeatLimit != null) {
+              throw APIError.from(
+                "UNPROCESSABLE_ENTITY",
+                INVITE_ERROR_CODES.ORG_FIELDS_NOT_ALLOWED
+              );
+            }
+            creator = await getAuthUser(ctx);
+            const access = await requireOrgInviteAccess(
+              ctx,
+              creator,
+              ctx.body.organizationId,
+              "create"
+            );
+            org = access.org;
+            if (org.disabledAt) {
+              throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.ORG_DISABLED);
+            }
+            organizationRole =
+              ctx.body.organizationRole ?? orgOpts?.defaultOrganizationRole ?? "member";
+            const known = await knownOrgRoles(ctx, org.id);
+            if (!known.includes(organizationRole)) {
+              throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.INVALID_ORG_ROLE);
+            }
+            if (organizationRole === "owner") {
+              const creatorIsOwner = splitRoles(access.member.role).includes("owner");
+              if (!orgOpts?.allowOwnerInvites || !creatorIsOwner) {
+                throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.OWNER_INVITES_NOT_ALLOWED);
+              }
+            }
+            if (ctx.body.teamId) {
+              const team = await ctx.context.adapter
+                .findOne<TeamRecord>({
+                  model: "team",
+                  where: [{ field: "id", value: ctx.body.teamId }]
+                })
+                .catch(() => null);
+              if (!team || team.organizationId !== org.id) {
+                throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.TEAM_NOT_FOUND);
+              }
+            }
+            const limit = await seatLimitFor(ctx, org);
+            if (limit != null) {
+              if (type === "public" && maxUses == null) {
+                throw APIError.from(
+                  "UNPROCESSABLE_ENTITY",
+                  INVITE_ERROR_CODES.PUBLIC_ORG_INVITE_REQUIRES_MAX_USES
+                );
+              }
+              const needed = type === "private" ? 1 : (maxUses as number);
+              const { members, reserved } = await seatUsage(ctx, org.id);
+              if (members + reserved + needed > limit) {
+                await orgOpts?.onSeatLimitReached?.({ organization: org });
+                throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.SEAT_LIMIT_REACHED);
+              }
+            }
+          } else {
+            creator = await requireInviteAdmin(ctx);
+            if (ctx.body.organizationId || ctx.body.organizationRole || ctx.body.teamId) {
+              throw APIError.from(
+                "UNPROCESSABLE_ENTITY",
+                INVITE_ERROR_CODES.ORG_FIELDS_NOT_ALLOWED
+              );
+            }
+            if (kind === "org-create") {
+              await requireOrgFeatures();
+            } else if (ctx.body.presetSeatLimit != null) {
+              throw APIError.from(
+                "UNPROCESSABLE_ENTITY",
+                INVITE_ERROR_CODES.ORG_FIELDS_NOT_ALLOWED
+              );
+            }
+          }
+
+          let emailHasUser = false;
+          if (email) {
+            // Pending rows lock the email even past expiresAt.
+            // The admin must delete stale invites first.
+            const existing = await ctx.context.adapter.findOne<Invite>({
+              model: "invite",
+              where: [
+                { field: "email", value: email },
+                { field: "status", value: "pending" }
+              ]
+            });
+            if (existing) {
+              throw APIError.from("CONFLICT", INVITE_ERROR_CODES.EMAIL_ALREADY_INVITED);
+            }
+            const existingUser = unwrapUser(
+              (await ctx.context.internalAdapter.findUserByEmail(email)) as MaybeWithAccounts | null
+            );
+            if (existingUser && mode === "invite-only") {
+              // An org-bound invite to an existing account is an
+              // activation invite: no pre-created user, redeem merges
+              // the membership onto the signed-in user. App-kind
+              // invites grant nothing an existing user lacks.
+              if (kind === "app") {
+                throw APIError.from("CONFLICT", INVITE_ERROR_CODES.USER_ALREADY_EXISTS);
+              }
+              emailHasUser = true;
+            }
+          }
+
+          const expiresIn =
+            ctx.body.expiresIn ?? (type === "public" ? opts.publicExpiresIn : opts.expiresIn);
+          const expiresAt = expiresIn == null ? null : new Date(Date.now() + expiresIn * 1000);
+
+          let preCreatedUserId: string | null = null;
+          if (mode === "invite-only" && type === "private" && email && !emailHasUser) {
+            const created = await ctx.context.internalAdapter.createUser({
+              email,
+              name: ctx.body.name ?? "",
+              emailVerified: false,
+              role
+            });
+            preCreatedUserId = created.id;
+          }
+
+          const token = generateRandomString(32);
+          const tokenHash = await storedTokenValue(token, opts.hashTokens);
+          const now = new Date();
+
+          try {
+            const invite = await ctx.context.adapter.create<Omit<Invite, "id">, Invite>({
+              model: "invite",
+              data: {
+                type,
+                kind,
+                email,
+                name: ctx.body.name ?? null,
+                role,
+                tokenHash,
+                status: "pending",
+                mode,
+                organizationId: org?.id ?? null,
+                organizationRole,
+                teamId: kind === "org-join" ? (ctx.body.teamId ?? null) : null,
+                presetSeatLimit: kind === "org-create" ? (ctx.body.presetSeatLimit ?? null) : null,
+                preCreatedUserId,
+                createdByUserId: creator.id,
+                inviterName: creator.name ?? "",
+                inviterEmail: creator.email,
+                expiresAt,
+                maxUses,
+                useCount: 0,
+                revokedAt: null,
+                revokedByUserId: null,
+                createdAt: now,
+                updatedAt: now
+              }
+            });
+
+            const url = buildInviteUrl(ctx, token, type);
+            if (type === "private" && email) {
+              await opts.sendPrivateInvitation?.(
+                {
+                  email,
+                  name: ctx.body.name ?? null,
+                  role,
+                  kind,
+                  mode,
+                  url,
+                  token,
+                  inviterName: creator.name ?? "",
+                  inviterEmail: creator.email,
+                  organizationName: org?.name ?? null,
+                  expiresAt
+                },
+                ctx.request
+              );
+            } else {
+              await opts.sendPublicInvitation?.(
+                {
+                  role,
+                  kind,
+                  mode,
+                  url,
+                  token,
+                  inviterName: creator.name ?? "",
+                  inviterEmail: creator.email,
+                  organizationName: org?.name ?? null,
+                  maxUses,
+                  expiresAt
+                },
+                ctx.request
+              );
+            }
+            await opts.onInviteCreated?.({ invite, admin: creator });
+            // A private invite is a one-mailbox credential: only the
+            // emailed recipient may hold the link, never the creator. A
+            // public invite is meant to be shared, so it returns its link.
+            // Hand delivery without email = public invite with maxUses 1.
+            return ctx.json({
+              inviteId: invite.id,
+              expiresAt,
+              ...(type === "public" ? { token, url } : {})
+            });
+          } catch (e) {
+            // Leave nothing behind so the creator can retry cleanly.
+            await ctx.context.adapter
+              .deleteMany({
+                model: "invite",
+                where: [{ field: "tokenHash", value: tokenHash }]
+              })
+              .catch(() => {});
+            if (preCreatedUserId) {
+              await ctx.context.adapter
+                .delete({
+                  model: "user",
+                  where: [{ field: "id", value: preCreatedUserId }]
+                })
+                .catch(() => {});
+            }
+            throw e;
+          }
+        }
+      ),
+
+      acceptInvite: createAuthEndpoint(
+        "/invite/accept",
+        {
+          method: "POST",
+          body: z.object({
+            token: z.string().min(1),
+            password: z.string().min(1),
+            name: z.string().max(200).optional(),
+            email: z.email().optional(),
+            organizationName: z.string().max(200).optional(),
+            organizationSlug: z.string().max(200).optional()
+          })
+        },
+        async (ctx) => {
+          if (getMode() !== "invite-only") {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ACCEPT_ONLY_IN_INVITE_ONLY_MODE);
+          }
+          return await acceptCore(ctx, ctx.body);
+        }
+      ),
+
+      activateInvite: createAuthEndpoint(
+        "/invite/activate",
+        {
+          method: "POST",
+          body: z.object({
+            token: z.string().min(1),
+            organizationName: z.string().max(200).optional(),
+            organizationSlug: z.string().max(200).optional()
+          })
+        },
+        async (ctx) => {
+          if (getMode() !== "open") {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ACTIVATE_ONLY_IN_OPEN_MODE);
+          }
+          return await activateCore(ctx, ctx.body);
+        }
+      ),
+
+      redeemInvite: createAuthEndpoint(
+        "/invite/redeem",
+        {
+          method: "POST",
+          body: z.object({
+            token: z.string().min(1),
+            password: z.string().min(1).optional(),
+            name: z.string().max(200).optional(),
+            email: z.email().optional(),
+            organizationName: z.string().max(200).optional(),
+            organizationSlug: z.string().max(200).optional()
+          })
+        },
+        async (ctx) => {
+          // One door for every kind and both modes; the invite row and
+          // the resolved mode decide what happens under the hood.
+          if (getMode() !== "invite-only") {
+            return await activateCore(ctx, ctx.body);
+          }
+          // Invites held by existing accounts redeem as activations: a
+          // private invite without a pre-created user was issued to an
+          // existing account, and a signed-in user redeeming a public
+          // invite already has one.
+          const invite = await findInviteByToken(ctx, ctx.body.token);
+          if (invite?.type === "private" && !invite.preCreatedUserId) {
+            return await activateCore(ctx, ctx.body);
+          }
+          if (invite?.type === "public") {
+            const session = await getSessionFromCtx(ctx).catch(() => null);
+            if (session) return await activateCore(ctx, ctx.body);
+          }
+          return await acceptCore(ctx, ctx.body);
+        }
+      ),
+
+      getInvite: createAuthEndpoint(
+        "/invite/get",
+        {
+          method: "GET",
+          query: z.object({
+            token: z.string().min(1)
+          })
+        },
+        async (ctx) => {
+          const invite = await findInviteByToken(ctx, ctx.query.token);
+          if (!invite) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+          }
+          const status = deriveStatus(invite);
+          if (status === "expired") {
+            await opts.onInviteExpired?.({ invite });
+          }
+
+          let organizationName: string | null = null;
+          if (invite.kind === "org-join" && invite.organizationId && orgEnabled()) {
+            const org = await findOrg(ctx, invite.organizationId);
+            organizationName = org?.name ?? null;
+          }
+
+          // nextAction drives a single invite page for every kind.
+          const session = await getSessionFromCtx(ctx).catch(() => null);
+          let nextAction: "SIGN_UP" | "SIGN_IN" | "CONFIRM" | null = null;
+          if (status === "pending") {
+            if (getMode() === "invite-only") {
+              // Activation invites (existing accounts) sign in, not up.
+              const activation =
+                (invite.type === "private" && !invite.preCreatedUserId) ||
+                (invite.type === "public" && !!session);
+              nextAction = activation ? (session ? "CONFIRM" : "SIGN_IN") : "SIGN_UP";
+            } else {
+              nextAction = session ? "CONFIRM" : "SIGN_IN";
+            }
+          }
+          const requiredFields: string[] = [];
+          if (nextAction === "SIGN_UP") {
+            requiredFields.push("password");
+            if (invite.type === "public") requiredFields.push("email");
+          }
+          if (invite.kind === "org-create" && nextAction) {
+            requiredFields.push("organizationName", "organizationSlug");
+          }
+
+          return ctx.json({
+            type: invite.type,
+            kind: invite.kind,
+            email: invite.email
+              ? opts.exposeEmailOnGet
+                ? invite.email
+                : maskEmail(invite.email)
+              : null,
+            role: invite.role,
+            status,
+            organizationName,
+            nextAction,
+            requiredFields,
+            expiresAt: invite.expiresAt,
+            maxUses: invite.maxUses,
+            useCount: invite.useCount,
+            usesRemaining:
+              invite.maxUses == null ? null : Math.max(0, invite.maxUses - invite.useCount)
+          });
+        }
+      ),
+
+      // Same single indexed lookup the org plugin's /organization/check-slug
+      // runs, but gated by a pending org-create invite token instead of a
+      // session, so the anonymous sign-up form can check without opening a
+      // slug enumeration oracle.
+      checkInviteSlug: createAuthEndpoint(
+        "/invite/check-slug",
+        {
+          method: "GET",
+          query: z.object({
+            token: z.string().min(1),
+            slug: z.string().min(1).max(100)
+          })
+        },
+        async (ctx) => {
+          const invite = await findInviteByToken(ctx, ctx.query.token);
+          if (!invite || invite.kind !== "org-create" || deriveStatus(invite) !== "pending") {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+          }
+          const existing = await ctx.context.adapter.findOne<OrganizationRecord>({
+            model: "organization",
+            where: [
+              {
+                field: "slug",
+                value: ctx.query.slug.trim().toLowerCase()
+              }
+            ]
+          });
+          if (existing) {
+            throw APIError.from("CONFLICT", INVITE_ERROR_CODES.ORG_SLUG_TAKEN);
+          }
+          return ctx.json({ status: true });
+        }
+      ),
+
+      listInvites: createAuthEndpoint(
+        "/invite/list",
+        {
+          method: "GET",
+          use: [sessionMiddleware],
+          query: z.object({
+            status: z.enum(["pending", "accepted", "cancelled", "expired"]).optional(),
+            type: z.enum(["private", "public"]).optional(),
+            organizationId: z.string().optional(),
+            page: z.coerce.number().int().positive().default(1),
+            limit: z.coerce.number().int().positive().max(100).default(20)
+          })
+        },
+        async (ctx) => {
+          const user = await getAuthUser(ctx);
+          const admin = await isInviteAdmin(user);
+          const now = new Date();
+          const where = [
+            ...(ctx.query.type ? [{ field: "type", value: ctx.query.type }] : []),
+            ...(ctx.query.status === "expired"
+              ? [
+                  { field: "status", value: "pending" },
+                  { field: "expiresAt", value: now, operator: "lt" as const }
+                ]
+              : ctx.query.status
+                ? [{ field: "status", value: ctx.query.status }]
+                : [])
+          ];
+          if (admin) {
+            if (ctx.query.organizationId) {
+              where.push({
+                field: "organizationId",
+                value: ctx.query.organizationId
+              });
+            }
+          } else {
+            // Org members with invitation:create see their org only.
+            if (!orgEnabled() || !ctx.query.organizationId) {
+              throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
+            }
+            const access = await requireOrgInviteAccess(
+              ctx,
+              user,
+              ctx.query.organizationId,
+              "create"
+            );
+            where.push({ field: "organizationId", value: access.org.id });
+          }
+          const [invites, total] = await Promise.all([
+            ctx.context.adapter.findMany<Invite>({
+              model: "invite",
+              where,
+              limit: ctx.query.limit,
+              offset: (ctx.query.page - 1) * ctx.query.limit,
+              sortBy: { field: "createdAt", direction: "desc" }
+            }),
+            ctx.context.adapter.count({ model: "invite", where })
+          ]);
+          const uses = invites.length
+            ? await ctx.context.adapter.findMany<InviteUse>({
+                model: "inviteUse",
+                where: [
+                  {
+                    field: "inviteId",
+                    value: invites.map((i) => i.id),
+                    operator: "in"
+                  }
+                ]
+              })
+            : [];
+          const byInvite = new Map<string, InviteUse[]>();
+          for (const u of uses) {
+            const list = byInvite.get(u.inviteId) ?? [];
+            list.push(u);
+            byInvite.set(u.inviteId, list);
+          }
+          return ctx.json({
+            invites: invites.map((i) => {
+              const { tokenHash: _tokenHash, ...rest } = i;
+              return {
+                ...rest,
+                status: deriveStatus(i, now),
+                uses: byInvite.get(i.id) ?? []
+              };
+            }),
+            total,
+            page: ctx.query.page,
+            limit: ctx.query.limit
+          });
+        }
+      ),
+
+      revokeInvite: createAuthEndpoint(
+        "/invite/revoke",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            inviteId: z.string().min(1)
+          })
+        },
+        async (ctx) => {
+          const user = await getAuthUser(ctx);
+          const invite = await ctx.context.adapter.findOne<Invite>({
+            model: "invite",
+            where: [{ field: "id", value: ctx.body.inviteId }]
+          });
+          if (!invite) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+          }
+          // App admin is a moderation backstop; org members need
+          // invitation:cancel in the invite's org.
+          if (!(await isInviteAdmin(user))) {
+            if (!orgEnabled() || !invite.organizationId) {
+              throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
+            }
+            await requireOrgInviteAccess(ctx, user, invite.organizationId, "cancel");
+          }
+          // CAS: only pending invites can be revoked; racers lose cleanly.
+          const revoked = await ctx.context.adapter.update<Invite>({
+            model: "invite",
+            where: [
+              { field: "id", value: ctx.body.inviteId },
+              { field: "status", value: "pending" }
+            ],
+            update: {
+              status: "cancelled",
+              revokedAt: new Date(),
+              revokedByUserId: user.id,
+              updatedAt: new Date()
+            }
+          });
+          if (!revoked) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+          }
+          await opts.onInviteRevoked?.({ invite: revoked, admin: user });
+          return ctx.json({ revoked: true });
+        }
+      ),
+
+      deleteInvite: createAuthEndpoint(
+        "/invite/delete",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            inviteId: z.string().min(1)
+          })
+        },
+        async (ctx) => {
+          const user = await getAuthUser(ctx);
+          const invite = await ctx.context.adapter.findOne<Invite>({
+            model: "invite",
+            where: [{ field: "id", value: ctx.body.inviteId }]
+          });
+          if (!invite) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
+          }
+          if (!(await isInviteAdmin(user))) {
+            if (!orgEnabled() || !invite.organizationId) {
+              throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
+            }
+            await requireOrgInviteAccess(ctx, user, invite.organizationId, "cancel");
+          }
+          if (invite.status === "accepted") {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ACCEPTED_INVITES_ARE_PERMANENT);
+          }
+          if (invite.useCount > 0) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.USED_INVITES_CANNOT_BE_DELETED);
+          }
+          await deleteInviteAndInertUser(ctx, invite);
+          await opts.onInviteDeleted?.({ invite, admin: user });
+          return ctx.json({ deleted: true });
+        }
+      ),
+
+      setOrgSeatLimit: createAuthEndpoint(
+        "/invite/org/set-seat-limit",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            organizationId: z.string().min(1),
+            seatLimit: z.number().int().positive().nullable()
+          })
+        },
+        async (ctx) => {
+          await requireInviteAdmin(ctx);
+          await requireOrgFeatures();
+          const org = await findOrg(ctx, ctx.body.organizationId);
+          if (!org) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ORG_NOT_FOUND);
+          }
+          await ctx.context.adapter.update({
+            model: "organization",
+            where: [{ field: "id", value: org.id }],
+            update: { seatLimit: ctx.body.seatLimit }
+          });
+          return ctx.json({ seatLimit: ctx.body.seatLimit });
+        }
+      ),
+
+      orgInviteUsage: createAuthEndpoint(
+        "/invite/org/usage",
+        {
+          method: "GET",
+          use: [sessionMiddleware],
+          query: z.object({
+            organizationId: z.string().min(1)
+          })
+        },
+        async (ctx) => {
+          await requireOrgFeatures();
+          const user = await getAuthUser(ctx);
+          let org: OrganizationRecord | null;
+          if (await isInviteAdmin(user)) {
+            org = await findOrg(ctx, ctx.query.organizationId);
+            if (!org) {
+              throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ORG_NOT_FOUND);
+            }
+          } else {
+            const access = await requireOrgInviteAccess(
+              ctx,
+              user,
+              ctx.query.organizationId,
+              "create"
+            );
+            org = access.org;
+          }
+          const limit = await seatLimitFor(ctx, org);
+          const { members, reserved } = await seatUsage(ctx, org.id);
+          return ctx.json({
+            seatLimit: limit,
+            members,
+            pendingReserved: reserved,
+            remaining: limit == null ? null : Math.max(0, limit - members - reserved)
+          });
+        }
+      ),
+
+      disableOrg: createAuthEndpoint(
+        "/invite/org/disable",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            organizationId: z.string().min(1),
+            banMembers: z.boolean().default(false)
+          })
+        },
+        async (ctx) => {
+          await requireInviteAdmin(ctx);
+          await requireOrgFeatures();
+          const org = await findOrg(ctx, ctx.body.organizationId);
+          if (!org) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ORG_NOT_FOUND);
+          }
+          const disabledAt = new Date();
+          await ctx.context.adapter.update({
+            model: "organization",
+            where: [{ field: "id", value: org.id }],
+            update: { disabledAt }
+          });
+          const bannedMembers = ctx.body.banMembers ? await banOrgMembers(ctx, org.id) : 0;
+          await orgOpts?.onOrgDisabled?.({
+            organization: { ...org, disabledAt },
+            bannedMembers
+          });
+          return ctx.json({ disabled: true, bannedMembers });
+        }
+      ),
+
+      enableOrg: createAuthEndpoint(
+        "/invite/org/enable",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            organizationId: z.string().min(1)
+          })
+        },
+        async (ctx) => {
+          await requireInviteAdmin(ctx);
+          await requireOrgFeatures();
+          const org = await findOrg(ctx, ctx.body.organizationId);
+          if (!org) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ORG_NOT_FOUND);
+          }
+          await ctx.context.adapter.update({
+            model: "organization",
+            where: [{ field: "id", value: org.id }],
+            update: { disabledAt: null }
+          });
+          await orgOpts?.onOrgEnabled?.({
+            organization: { ...org, disabledAt: null }
+          });
+          return ctx.json({ enabled: true });
+        }
+      ),
+
+      deleteOrg: createAuthEndpoint(
+        "/invite/org/delete",
+        {
+          method: "POST",
+          use: [sessionMiddleware],
+          body: z.object({
+            organizationId: z.string().min(1),
+            banMembers: z.boolean().default(false)
+          })
+        },
+        async (ctx) => {
+          await requireInviteAdmin(ctx);
+          await requireOrgFeatures();
+          const org = await findOrg(ctx, ctx.body.organizationId);
+          if (!org) {
+            throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ORG_NOT_FOUND);
+          }
+          // Ban first while member rows still exist.
+          const bannedMembers = ctx.body.banMembers ? await banOrgMembers(ctx, org.id) : 0;
+
+          const teams = await ctx.context.adapter
+            .findMany<TeamRecord>({
+              model: "team",
+              where: [{ field: "organizationId", value: org.id }],
+              limit: 100000
+            })
+            .catch(() => [] as TeamRecord[]);
+          if (teams.length > 0) {
+            await ctx.context.adapter
+              .deleteMany({
+                model: "teamMember",
+                where: [
+                  {
+                    field: "teamId",
+                    value: teams.map((t) => t.id),
+                    operator: "in"
+                  }
+                ]
+              })
+              .catch(() => {});
+            await ctx.context.adapter
+              .deleteMany({
+                model: "team",
+                where: [{ field: "organizationId", value: org.id }]
+              })
+              .catch(() => {});
+          }
+          await ctx.context.adapter.deleteMany({
+            model: "member",
+            where: [{ field: "organizationId", value: org.id }]
+          });
+          const invites = await ctx.context.adapter.findMany<Invite>({
+            model: "invite",
+            where: [{ field: "organizationId", value: org.id }],
+            limit: 100000
+          });
+          if (invites.length > 0) {
+            await ctx.context.adapter.deleteMany({
+              model: "inviteUse",
+              where: [
+                {
+                  field: "inviteId",
+                  value: invites.map((i) => i.id),
+                  operator: "in"
+                }
+              ]
+            });
+            await ctx.context.adapter.deleteMany({
+              model: "invite",
+              where: [{ field: "organizationId", value: org.id }]
+            });
+          }
+          // The org plugin's own invitation table, when present.
+          await ctx.context.adapter
+            .deleteMany({
+              model: "invitation",
+              where: [{ field: "organizationId", value: org.id }]
+            })
+            .catch(() => {});
+          await ctx.context.adapter
+            .updateMany({
+              model: "session",
+              where: [{ field: "activeOrganizationId", value: org.id }],
+              update: { activeOrganizationId: null }
+            })
+            .catch(() => {});
+          await ctx.context.adapter.delete({
+            model: "organization",
+            where: [{ field: "id", value: org.id }]
+          });
+          await orgOpts?.onOrgDeleted?.({ organization: org, bannedMembers });
+          return ctx.json({ deleted: true, bannedMembers });
+        }
+      ),
+
+      cleanupExpiredInvites: createAuthEndpoint(
+        "/invite/cleanup-expired",
+        {
+          method: "POST",
+          metadata: { SERVER_ONLY: true }
+        },
+        async (ctx) => {
+          const expired = await ctx.context.adapter.findMany<Invite>({
+            model: "invite",
+            where: [
+              { field: "status", value: "pending" },
+              { field: "expiresAt", value: new Date(), operator: "lt" }
+            ]
+          });
+          let deleted = 0;
+          for (const invite of expired) {
+            if (invite.useCount > 0) continue;
+            await deleteInviteAndInertUser(ctx, invite);
+            await opts.onInviteDeleted?.({ invite, admin: null });
+            deleted++;
+          }
+          return ctx.json({ deleted });
+        }
+      )
+    }
+  } satisfies BetterAuthPlugin;
+};

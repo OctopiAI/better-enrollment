@@ -1,0 +1,70 @@
+{
+  "name": "@octopi-ai/better-enrollment",
+  "version": "0.1.0",
+  "description": "Invite-only signups, role-merging invite links, and organization invites for Better Auth. Private and public invites, org seat limits, full audit trail.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/OctopiAI/better-enrollment",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OctopiAI/better-enrollment.git"
+  },
+  "keywords": [
+    "better-auth",
+    "better-auth-plugin",
+    "enrollment",
+    "invite",
+    "invitation",
+    "invite-only",
+    "signup",
+    "roles",
+    "auth"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./client": {
+      "types": "./dist/client.d.mts",
+      "import": "./dist/client.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "dist",
+    "examples",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "format:write": "prettier --write \"./**/*.{ts,md,json}\" --config .prettierrc",
+    "format:check": "prettier --check \"./**/*.{ts,md,json}\" --config .prettierrc",
+    "prepublishOnly": "pnpm test && pnpm build"
+  },
+  "peerDependencies": {
+    "better-auth": ">=1.4.0",
+    "zod": ">=4.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "better-auth": "latest",
+    "better-sqlite3": "^12.2.0",
+    "prettier": "^3.9.6",
+    "tsdown": "latest",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0",
+    "zod": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@11.20.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}
