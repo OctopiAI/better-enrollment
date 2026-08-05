@@ -134,6 +134,8 @@ export const authClient = createAuthClient({
 - All state changes are guarded atomic writes: parallel redemptions of a one-seat invite produce exactly one winner. Expiry is derived from `expiresAt` at read time, so there is no cron and nothing to sweep.
 - While a private invite is pending, its email is locked on every path: sign-in, sign-up, password reset, and OAuth linking are all blocked without leaking that the invite exists.
 
+> **Role changes made outside this plugin do not merge.** Better Auth stores multiple roles as one comma-separated string (for example `"user,org-creator"`), and only invite redemption merges into it as a union. The admin plugin's `setRole` (and any direct write) replaces the field with exactly what you send, so a bare `setRole({ role: "admin" })` silently strips invite-granted roles. When changing roles from your own admin UI, always send the full set: `role: [...existingRoles, "admin"]`.
+
 ---
 
 ## The two modes
@@ -576,6 +578,10 @@ A Prisma example lives in [`examples/prisma`](./examples/prisma).
 - **Runtime sign-up backstop for invite-only mode.** A `user.create` database hook that rejects any user creation not originating from this plugin's own flows (or the admin plugin), so sign-up paths the mode detection cannot see (magic link, email OTP, passkey, phone number, anonymous, generic OAuth) are blocked at runtime instead of by configuration discipline alone. Until this lands, closing those paths is the developer's responsibility.
 
 - **A `better-enrollment` skill on [skills.sh](https://skills.sh).** An Agent Skill that teaches coding agents how to install the plugin, pick the right mode, wire up delivery, and build the invite page, so adding Better Enrollment to a project is a one-prompt job.
+
+- **A changelog blog on the [docs site](https://better-enrollment.octopi.ai).** Versioned release notes for every Better Enrollment release: what changed, why, and any migration steps, so you can upgrade with confidence instead of diffing the source. Until it lands, [GitHub releases](https://github.com/OctopiAI/better-enrollment/releases) are the record.
+
+Have an idea or found a problem? [Open an issue](https://github.com/OctopiAI/better-enrollment/issues).
 
 ## License
 
