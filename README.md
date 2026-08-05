@@ -575,6 +575,8 @@ A Prisma example lives in [`examples/prisma`](./examples/prisma).
 
 - **Runtime sign-up backstop for invite-only mode.** A `user.create` database hook that rejects any user creation not originating from this plugin's own flows (or the admin plugin), so sign-up paths the mode detection cannot see (magic link, email OTP, passkey, phone number, anonymous, generic OAuth) are blocked at runtime instead of by configuration discipline alone. Until this lands, closing those paths is the developer's responsibility.
 
+- **A `better-enrollment` skill on [skills.sh](https://skills.sh).** An Agent Skill that teaches coding agents how to install the plugin, pick the right mode, wire up delivery, and build the invite page, so adding Better Enrollment to a project is a one-prompt job.
+
 ## License
 
 MIT
