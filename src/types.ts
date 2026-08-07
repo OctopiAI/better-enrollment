@@ -218,7 +218,9 @@ export interface BetterEnrollmentOptions {
    */
   buildInviteUrl?: (data: { token: string; type: InviteType; mode: InviteMode }) => string;
 
-  onInviteCreated?: (data: { invite: Invite; admin: User }) => Promise<void> | void;
+  /** `admin` is null when the invite was created through the server-only system endpoint. */
+  onInviteCreated?: (data: { invite: Invite; admin: User | null }) => Promise<void> | void;
+  onInviteResent?: (data: { invite: Invite; admin: User }) => Promise<void> | void;
   onInviteAccepted?: (data: { invite: Invite; user: User }) => Promise<void> | void;
   onInviteRevoked?: (data: { invite: Invite; admin: User }) => Promise<void> | void;
   onInviteDeleted?: (data: { invite: Invite; admin: User | null }) => Promise<void> | void;

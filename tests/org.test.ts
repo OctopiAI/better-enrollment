@@ -10,6 +10,7 @@ import {
   findUserByEmail,
   seedAdmin,
   seedUser,
+  sentInvites,
   signInHeaders,
   type TestAuth
 } from "./helpers";
@@ -423,7 +424,7 @@ describe("org-join creation gate", () => {
 });
 
 describe("org-join redemption (invite-only)", () => {
-  it("accept joins the org, sets active organization, keeps app and org roles separate", async () => {
+  it("accept joins the org without creating a session, keeps app and org roles separate", async () => {
     const { auth, org, ownerHeaders } = await setupOrg();
     const created = await createInvite(auth, {
       body: {
@@ -438,6 +439,7 @@ describe("org-join redemption (invite-only)", () => {
     });
     expect(res.organization?.id).toBe(org.id);
     expect(res.organization?.name).toBe("Acme");
+    expect(res.token).toBeUndefined();
 
     const user = await findUserByEmail(auth, "joiner@acme.com");
     expect(user?.emailVerified).toBe(true);
@@ -446,14 +448,14 @@ describe("org-join redemption (invite-only)", () => {
     const member = await getMemberRow(auth, user!.id, org.id);
     expect(member?.role).toBe("member");
 
+    // No session was created for the joiner; the app owns sign-in and
+    // active-organization selection.
     const ctx = await auth.$context;
-    const session = await ctx.adapter.findOne<{
-      activeOrganizationId: string | null;
-    }>({
+    const sessions = await ctx.adapter.findMany<{ id: string }>({
       model: "session",
-      where: [{ field: "token", value: res.token }]
+      where: [{ field: "userId", value: user!.id }]
     });
-    expect(session?.activeOrganizationId).toBe(org.id);
+    expect(sessions).toHaveLength(0);
   });
 
   it("team invites add the member to the team; wrong-org teams are rejected at create", async () => {
@@ -684,6 +686,58 @@ describe("seat limits", () => {
     expect(second.token).toBeTruthy();
   });
 
+  it("resending an expired invite re-arms its reservation, so the limit must hold", async () => {
+    const { auth, org, ownerHeaders, adminHeaders } = await setupOrg();
+    await api(auth).setOrgSeatLimit({
+      body: { organizationId: org.id, seatLimit: 2 },
+      headers: adminHeaders
+    });
+    const first = await createInvite(auth, {
+      body: { kind: "org-join", email: "one@acme.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    await expireInvite(auth, first.inviteId);
+    // The freed seat went to a second invite; reviving the first would
+    // overshoot the limit.
+    await createInvite(auth, {
+      body: { kind: "org-join", email: "two@acme.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    expect(
+      await errCode(
+        api(auth).resendInvite({ body: { inviteId: first.inviteId }, headers: ownerHeaders })
+      )
+    ).toBe("SEAT_LIMIT_REACHED");
+  });
+
+  it("org owner resends an org-join invite; plain members cannot", async () => {
+    const { auth, org, ownerHeaders } = await setupOrg();
+    const created = await createInvite(auth, {
+      body: { kind: "org-join", email: "again@acme.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    const res = await api(auth).resendInvite({
+      body: { inviteId: created.inviteId },
+      headers: ownerHeaders
+    });
+    expect(res.inviteId).toBe(created.inviteId);
+    const fresh = sentInvites(auth)[sentInvites(auth).length - 1]!;
+    expect(fresh.token).not.toBe(created.token);
+
+    const plain = await addOrgMember(auth, org.id, "noperm@acme.com");
+    expect(
+      await errCode(
+        api(auth).resendInvite({ body: { inviteId: created.inviteId }, headers: plain.headers })
+      )
+    ).toBe("ORG_INVITE_NOT_ALLOWED");
+
+    // The rotated link still redeems into the org.
+    await api(auth).redeemInvite({ body: { token: fresh.token, password: PASSWORD } });
+    const user = await findUserByEmail(auth, "again@acme.com");
+    const member = await getMemberRow(auth, user!.id, org.id);
+    expect(member?.role).toBe("member");
+  });
+
   it("accept-time guard catches out-of-band member growth", async () => {
     let seatHookFired = 0;
     const { auth, org, ownerHeaders, adminHeaders } = await setupOrg({
@@ -789,7 +843,7 @@ describe("seat limits", () => {
 });
 
 describe("org-create", () => {
-  it("founds the org on redeem: creator role, preset seat limit, active org", async () => {
+  it("founds the org on redeem: creator role, preset seat limit, no session", async () => {
     const { auth, adminHeaders } = await setupOrg();
     const created = await createInvite(auth, {
       body: {
@@ -824,13 +878,13 @@ describe("org-create", () => {
     const member = await getMemberRow(auth, founder!.id, org!.id);
     expect(member?.role).toBe("owner");
 
-    const session = await ctx.adapter.findOne<{
-      activeOrganizationId: string | null;
-    }>({
+    // No session for the founder; they sign in through the app afterwards.
+    expect(res.token).toBeUndefined();
+    const sessions = await ctx.adapter.findMany<{ id: string }>({
       model: "session",
-      where: [{ field: "token", value: res.token }]
+      where: [{ field: "userId", value: founder!.id }]
     });
-    expect(session?.activeOrganizationId).toBe(org!.id);
+    expect(sessions).toHaveLength(0);
   });
 
   it("slug conflicts fail cleanly with nothing partially created", async () => {
@@ -1080,6 +1134,69 @@ describe("uniform redemption flow", () => {
     expect(res.action).toBe("ACCEPTED");
     expect(res.role).toBe("user");
     const member = await getMemberRow(auth, user.id, org.id);
+    expect(member?.role).toBe("member");
+  });
+
+  it("open mode activation leaves the current session's active organization untouched", async () => {
+    const { auth, org, ownerHeaders } = await setupOrg({ open: true });
+    const created = await createInvite(auth, {
+      body: {
+        kind: "org-join",
+        email: "untouched@acme.com",
+        organizationId: org.id
+      },
+      headers: ownerHeaders
+    });
+    const user = await seedUser(auth, {
+      email: "untouched@acme.com",
+      password: PASSWORD,
+      role: "user"
+    });
+    const headers = await signInHeaders(auth, "untouched@acme.com", PASSWORD);
+    await api(auth).redeemInvite({ body: { token: created.token }, headers });
+
+    // Membership was written, but the session the user redeemed with was
+    // not switched to the new org; that choice belongs to the app.
+    const ctx = await auth.$context;
+    const sessions = await ctx.adapter.findMany<{
+      activeOrganizationId: string | null;
+    }>({
+      model: "session",
+      where: [{ field: "userId", value: user.id }]
+    });
+    expect(sessions.length).toBeGreaterThan(0);
+    for (const s of sessions) {
+      expect(s.activeOrganizationId ?? null).toBeNull();
+    }
+  });
+
+  it("org-join accepter signs in afterwards with no active organization preset", async () => {
+    const { auth, org, ownerHeaders } = await setupOrg();
+    const created = await createInvite(auth, {
+      body: {
+        kind: "org-join",
+        email: "fresh@acme.com",
+        organizationId: org.id
+      },
+      headers: ownerHeaders
+    });
+    await api(auth).redeemInvite({
+      body: { token: created.token, password: PASSWORD }
+    });
+    const headers = await signInHeaders(auth, "fresh@acme.com", PASSWORD);
+    expect(headers.get("cookie")).toBeTruthy();
+
+    const user = await findUserByEmail(auth, "fresh@acme.com");
+    const ctx = await auth.$context;
+    const sessions = await ctx.adapter.findMany<{
+      activeOrganizationId: string | null;
+    }>({
+      model: "session",
+      where: [{ field: "userId", value: user!.id }]
+    });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.activeOrganizationId ?? null).toBeNull();
+    const member = await getMemberRow(auth, user!.id, org.id);
     expect(member?.role).toBe("member");
   });
 

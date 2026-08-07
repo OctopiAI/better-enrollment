@@ -60,6 +60,11 @@ export async function createTestAuth(config?: {
 
 export type TestAuth = Awaited<ReturnType<typeof createTestAuth>>;
 
+/** Every invite delivery captured for this auth instance, in send order. */
+export function sentInvites(auth: TestAuth): SentInvite[] {
+  return sentByAuth.get(auth) ?? [];
+}
+
 export async function seedUser(
   auth: TestAuth,
   user: {

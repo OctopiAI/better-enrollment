@@ -337,7 +337,7 @@ describe("invite-only mode", () => {
     expect(got.email).toBe("full@test.com");
   });
 
-  it("accept happy path: credential account created, verified, name applied, session cookie set", async () => {
+  it("accept happy path: credential account created, verified, name applied, no session", async () => {
     const onInviteAccepted = vi.fn();
     const auth = await createTestAuth({ invite: { onInviteAccepted } });
     const headers = await seedAdmin(auth);
@@ -349,7 +349,11 @@ describe("invite-only mode", () => {
       body: { token, password: "password123", name: "Happy User" },
       returnHeaders: true
     });
-    expect(res.headers.get("set-cookie")).toBeTruthy();
+    // The plugin never creates or mutates sessions; the accepter signs in
+    // through the app's own flow afterwards.
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(res.response.action).toBe("ACCEPTED");
+    expect("token" in res.response).toBe(false);
 
     const user = await findUserByEmail(auth, "happy@test.com");
     expect(user?.emailVerified).toBe(true);
