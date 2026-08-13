@@ -68,7 +68,7 @@ Better Enrollment runs in one of two modes, auto-detected from your config: **in
 Redemption never creates a session. After redeeming, the user signs in through your normal flow with the credentials they just set:
 
 ```ts
-await authClient.invite.redeem({ token, password, email });
+await authClient.invite.redeem({ token, password, name, email });
 await authClient.signIn.email({ email, password });
 ```
 
@@ -201,6 +201,18 @@ await authClient.invite.redeem({ token, password, name, email });
 await authClient.signIn.email({ email, password });
 ```
 
+Sign-up redemptions always collect `password` and `name`; public invites add `email`, and `org-create` adds `organizationName` and `organizationSlug`. Need more than that, say a department or a referral code? Declare [additional fields](https://better-enrollment.octopi.ai/docs/options#additional-fields) with a type, requiredness, an optional zod validator, and the steps that collect them (`SIGN_UP` by default, `CONFIRM` for signed-in activations), and they flow through `requiredFields` / `optionalFields`, the redeem body, and onto the user row:
+
+```ts
+betterEnrollment({
+  additionalFields: {
+    department: { type: "string" },
+    referral: { type: "string", required: false },
+    team: { type: "string", actions: ["SIGN_UP", "CONFIRM"] }
+  }
+});
+```
+
 `invite.get` returns a deliberately thin payload: kind, role, derived status, expiry, uses remaining, and a masked email. Never the inviter's identity or internal ids. Full rendering guide: [The invite page](https://better-enrollment.octopi.ai/docs/invite-page).
 
 ---
@@ -281,6 +293,7 @@ betterEnrollment({
   defaultRole: "user",
   expiresIn: 60 * 60 * 24 * 7,
   adminRoles: ["admin"],
+  additionalFields: {/* extra sign-up fields, see docs */},
   buildInviteUrl,
   organization: {/* ... */},
   onInviteCreated,

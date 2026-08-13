@@ -68,6 +68,54 @@ export interface TeamRecord {
   organizationId: string;
 }
 
+/**
+ * Structural Standard Schema shape (https://standardschema.dev). Zod v4
+ * schemas satisfy it, so validators can be plain zod: `z.string().min(2)`.
+ */
+export interface StandardSchemaLike {
+  "~standard": {
+    validate: (
+      value: unknown
+    ) =>
+      | { value: unknown; issues?: undefined }
+      | { issues: ReadonlyArray<{ message?: string }> }
+      | Promise<unknown>;
+  };
+}
+
+export type InviteAdditionalFieldType = "string" | "number" | "boolean" | "date";
+
+/**
+ * The two nextActions that render a form and may carry additional
+ * fields. SIGN_IN and the terminal state collect nothing.
+ */
+export type InviteFieldAction = "SIGN_UP" | "CONFIRM";
+
+/**
+ * One extra field collected at redemption. Mirrors Better Auth's
+ * additionalFields attribute shape: type, required (default true),
+ * defaultValue, and an optional standard-schema input validator.
+ */
+export interface InviteAdditionalField {
+  type: InviteAdditionalFieldType;
+  /**
+   * Which redemption steps collect this field. "SIGN_UP" is the
+   * account-creating accept flow; "CONFIRM" is a signed-in activation.
+   * Default ["SIGN_UP"]. The list is exact, never additive: ["CONFIRM"]
+   * means confirm only; name both steps to collect on both forms.
+   */
+  actions?: InviteFieldAction[];
+  /**
+   * Whether redemption must provide a value. Default true, matching
+   * Better Auth. A field with a defaultValue never fails this check.
+   */
+  required?: boolean;
+  /** Applied when redemption provides no value. */
+  defaultValue?: string | number | boolean | Date | (() => string | number | boolean | Date);
+  /** Validated against the provided value; synchronous schemas only. */
+  validator?: { input?: StandardSchemaLike };
+}
+
 /** Structural type for roles built with createAccessControl().newRole(). */
 export interface OrgRoleLike {
   authorize: (
@@ -206,6 +254,17 @@ export interface BetterEnrollmentOptions {
   canManageInvites?: (user: User & { role?: string | null }) => Promise<boolean> | boolean;
 
   /**
+   * Extra user fields collected when a redemption signs the invitee up
+   * (nextAction SIGN_UP). The plugin adds them to the user model schema
+   * (nullable at the database level; requiredness is enforced by the
+   * redeem flow), validates the redeem body against them, stores the
+   * values on the created or claimed user, and lists them in GET
+   * /invite/get so the invite page knows what to render. Do not also
+   * declare these under user.additionalFields.
+   */
+  additionalFields?: Record<string, InviteAdditionalField>;
+
+  /**
    * Enables organization plugin integration: org-join and org-create
    * invite kinds, seat limits, and platform controls. Requires the
    * organization plugin to be registered.
@@ -293,6 +352,9 @@ export const INVITE_ERROR_CODES = {
     "An invitation link is required to activate your account"
   ),
   PASSWORD_REQUIRED: err("PASSWORD_REQUIRED", "A password is required to accept this invitation"),
+  NAME_REQUIRED: err("NAME_REQUIRED", "A name is required to accept this invitation"),
+  ADDITIONAL_FIELD_REQUIRED: err("ADDITIONAL_FIELD_REQUIRED", "A required field is missing"),
+  ADDITIONAL_FIELD_INVALID: err("ADDITIONAL_FIELD_INVALID", "A field value failed validation"),
   USER_BANNED: err("USER_BANNED", "This account has been banned"),
 
   ORG_FEATURES_DISABLED: err(

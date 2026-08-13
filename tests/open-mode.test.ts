@@ -218,7 +218,7 @@ describe("open mode", () => {
     expect(
       (
         await captureError(() =>
-          auth.api.acceptInvite({ body: { token, password: "password123" } })
+          auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } })
         )
       )?.status
     ).toBe("BAD_REQUEST");

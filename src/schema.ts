@@ -1,4 +1,5 @@
 import type { BetterAuthPlugin } from "better-auth";
+import type { InviteAdditionalField } from "./types";
 
 const inviteFields = {
   type: { type: "string", required: true, input: false },
@@ -56,11 +57,23 @@ const inviteUseFields = {
 /**
  * The organization extension is added only when org features are configured,
  * so apps without the org plugin never get a stray organization table.
+ *
+ * Additional fields extend the user model but are always nullable at the
+ * database level: pre-created and open-mode users exist before redemption
+ * collects a value. Requiredness is enforced by the redeem flow instead.
  */
-export function buildSchema(withOrg: boolean) {
+export function buildSchema(
+  withOrg: boolean,
+  additionalUserFields?: Record<string, InviteAdditionalField>
+) {
+  const userFields: Record<string, { type: InviteAdditionalField["type"]; required: false }> = {};
+  for (const [name, field] of Object.entries(additionalUserFields ?? {})) {
+    userFields[name] = { type: field.type, required: false };
+  }
   return {
     invite: { fields: inviteFields },
     inviteUse: { fields: inviteUseFields },
+    ...(Object.keys(userFields).length > 0 ? { user: { fields: userFields } } : {}),
     ...(withOrg
       ? {
           organization: {

@@ -1,6 +1,6 @@
 {
   "name": "@octopi-ai/better-enrollment",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Invite-only signups, role-merging invite links, and organization invites for Better Auth. Private and public invites, org seat limits, full audit trail.",
   "type": "module",
   "license": "MIT",

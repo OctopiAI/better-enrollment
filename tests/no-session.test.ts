@@ -36,7 +36,7 @@ describe("redemption never creates a session", () => {
       headers
     });
     const res = await auth.api.acceptInvite({
-      body: { token, password: "password123" },
+      body: { token, password: "password123", name: "Invitee" },
       returnHeaders: true
     });
     expect(res.headers.get("set-cookie")).toBeNull();
@@ -59,7 +59,7 @@ describe("redemption never creates a session", () => {
       headers
     });
     const res = await auth.api.redeemInvite({
-      body: { token, password: "password123" },
+      body: { token, password: "password123", name: "Invitee" },
       returnHeaders: true
     });
     expect(res.headers.get("set-cookie")).toBeNull();
@@ -75,7 +75,7 @@ describe("redemption never creates a session", () => {
       headers
     });
     const res = await auth.api.acceptInvite({
-      body: { token, password: "password123", email: "open@test.com" },
+      body: { token, password: "password123", email: "open@test.com", name: "Invitee" },
       returnHeaders: true
     });
     expect(res.headers.get("set-cookie")).toBeNull();
@@ -107,7 +107,7 @@ describe("redemption never creates a session", () => {
       headers
     });
     await auth.api.acceptInvite({
-      body: { token, password: "password123", email: "gated@test.com" }
+      body: { token, password: "password123", email: "gated@test.com", name: "Invitee" }
     });
 
     // With no redemption session, an unverified accepter has NO way in.
@@ -138,7 +138,7 @@ describe("redemption never creates a session", () => {
       headers
     });
     const res = await auth.api.acceptInvite({
-      body: { token, password: "password123", email: "auto@test.com" },
+      body: { token, password: "password123", email: "auto@test.com", name: "Invitee" },
       returnHeaders: true
     });
     expect(res.headers.get("set-cookie")).toBeNull();

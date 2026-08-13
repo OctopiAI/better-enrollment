@@ -47,10 +47,14 @@ describe("resending invitations", () => {
 
     // Old token is dead, new one redeems.
     const stale = await captureError(() =>
-      auth.api.acceptInvite({ body: { token: first.token, password: "password123" } })
+      auth.api.acceptInvite({
+        body: { token: first.token, password: "password123", name: "Invitee" }
+      })
     );
     expect(stale?.code).toBe("INVITE_NOT_FOUND");
-    await auth.api.acceptInvite({ body: { token: fresh.token, password: "password123" } });
+    await auth.api.acceptInvite({
+      body: { token: fresh.token, password: "password123", name: "Invitee" }
+    });
     const user = await findUserByEmail(auth, "resend@test.com");
     expect(user?.emailVerified).toBe(true);
   });
@@ -64,7 +68,9 @@ describe("resending invitations", () => {
     });
     await expireInvite(auth, first.inviteId);
     const expired = await captureError(() =>
-      auth.api.acceptInvite({ body: { token: first.token, password: "password123" } })
+      auth.api.acceptInvite({
+        body: { token: first.token, password: "password123", name: "Invitee" }
+      })
     );
     expect(expired?.code).toBe("INVITE_EXPIRED");
 
@@ -72,7 +78,9 @@ describe("resending invitations", () => {
     expect(res.expiresAt && res.expiresAt > new Date()).toBe(true);
 
     const fresh = sentInvites(auth)[1]!;
-    await auth.api.acceptInvite({ body: { token: fresh.token, password: "password123" } });
+    await auth.api.acceptInvite({
+      body: { token: fresh.token, password: "password123", name: "Invitee" }
+    });
     const user = await findUserByEmail(auth, "late@test.com");
     expect(user?.emailVerified).toBe(true);
   });
@@ -85,7 +93,7 @@ describe("resending invitations", () => {
       headers
     });
     await auth.api.acceptInvite({
-      body: { token: first.token, password: "password123", email: "one@test.com" }
+      body: { token: first.token, password: "password123", email: "one@test.com", name: "Invitee" }
     });
 
     const res = await auth.api.resendInvite({ body: { inviteId: first.inviteId }, headers });
@@ -95,19 +103,29 @@ describe("resending invitations", () => {
 
     const stale = await captureError(() =>
       auth.api.acceptInvite({
-        body: { token: first.token, password: "password123", email: "two@test.com" }
+        body: {
+          token: first.token,
+          password: "password123",
+          email: "two@test.com",
+          name: "Invitee"
+        }
       })
     );
     expect(stale?.code).toBe("INVITE_NOT_FOUND");
 
     // One of the two uses was consumed before the rotation and stays spent.
     await auth.api.acceptInvite({
-      body: { token: res.token!, password: "password123", email: "two@test.com" }
+      body: { token: res.token!, password: "password123", email: "two@test.com", name: "Invitee" }
     });
     // The cap is reached, so the invite settles to accepted.
     const exhausted = await captureError(() =>
       auth.api.acceptInvite({
-        body: { token: res.token!, password: "password123", email: "three@test.com" }
+        body: {
+          token: res.token!,
+          password: "password123",
+          email: "three@test.com",
+          name: "Invitee"
+        }
       })
     );
     expect(exhausted?.code).toBe("INVITE_ALREADY_USED");
@@ -121,7 +139,9 @@ describe("resending invitations", () => {
       body: { type: "private", email: "done@test.com" },
       headers
     });
-    await auth.api.acceptInvite({ body: { token: used.token, password: "password123" } });
+    await auth.api.acceptInvite({
+      body: { token: used.token, password: "password123", name: "Invitee" }
+    });
     const usedErr = await captureError(() =>
       auth.api.resendInvite({ body: { inviteId: used.inviteId }, headers })
     );

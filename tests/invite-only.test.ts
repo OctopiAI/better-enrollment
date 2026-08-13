@@ -108,7 +108,7 @@ describe("invite-only mode", () => {
 
     // The granted rank lands on the user created by redemption.
     await auth.api.acceptInvite({
-      body: { token: invite.token, password: "password123" }
+      body: { token: invite.token, password: "password123", name: "Invitee" }
     });
     const created = await findUserByEmail(auth, "newlead@test.com");
     expect((created as { role?: string })?.role).toBe("lead");
@@ -172,7 +172,7 @@ describe("invite-only mode", () => {
     expect(sent[0]!.url).toContain(sent[0]!.token);
 
     const accepted = await auth.api.acceptInvite({
-      body: { token: sent[0]!.token, password: "invitee-password-123" }
+      body: { token: sent[0]!.token, password: "invitee-password-123", name: "Invitee" }
     });
     expect(accepted).toBeTruthy();
   });
@@ -200,7 +200,12 @@ describe("invite-only mode", () => {
     expect(res.url).toContain(res.token);
 
     await auth.api.acceptInvite({
-      body: { token: res.token!, password: "password123", email: "handed@test.com" }
+      body: {
+        token: res.token!,
+        password: "password123",
+        email: "handed@test.com",
+        name: "Invitee"
+      }
     });
     // ...but possession of a shareable link never proves the mailbox, so the
     // account is created unverified, unlike a private invite's recipient.
@@ -210,7 +215,12 @@ describe("invite-only mode", () => {
     // And it is spent after that one use.
     const second = await captureError(() =>
       auth.api.acceptInvite({
-        body: { token: res.token!, password: "password123", email: "second@test.com" }
+        body: {
+          token: res.token!,
+          password: "password123",
+          email: "second@test.com",
+          name: "Invitee"
+        }
       })
     );
     expect(second?.status).toBe("BAD_REQUEST");
@@ -225,7 +235,9 @@ describe("invite-only mode", () => {
     });
     const row = await findInviteRow(auth, inviteId);
     expect(row?.tokenHash).not.toBe(token);
-    const res = await auth.api.acceptInvite({ body: { token, password: "password123" } });
+    const res = await auth.api.acceptInvite({
+      body: { token, password: "password123", name: "Invitee" }
+    });
     if (!("user" in res)) throw new Error("expected an accepted response");
     expect(res.user.email).toBe("hash@test.com");
   });
@@ -379,7 +391,12 @@ describe("invite-only mode", () => {
       role: "ghost"
     });
     const res = await auth.api.acceptInvite({
-      body: { token: "stale-token-1", password: "password123", email: "stale1@test.com" }
+      body: {
+        token: "stale-token-1",
+        password: "password123",
+        email: "stale1@test.com",
+        name: "Invitee"
+      }
     });
     if (!("user" in res)) throw new Error("expected an accepted response");
     expect(res.user.email).toBe("stale1@test.com");
@@ -393,7 +410,12 @@ describe("invite-only mode", () => {
     });
     const err = await captureError(() =>
       auth2.api.acceptInvite({
-        body: { token: "stale-token-2", password: "password123", email: "stale2@test.com" }
+        body: {
+          token: "stale-token-2",
+          password: "password123",
+          email: "stale2@test.com",
+          name: "Invitee"
+        }
       })
     );
     expect(err?.status).toBe("UNPROCESSABLE_ENTITY");
@@ -411,14 +433,16 @@ describe("invite-only mode", () => {
     expect(
       (
         await captureError(() =>
-          auth.api.acceptInvite({ body: { token, password: "password123" } })
+          auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } })
         )
       )?.status
     ).toBe("BAD_REQUEST");
     expect(
       (
         await captureError(() =>
-          auth.api.acceptInvite({ body: { token: "garbage", password: "password123" } })
+          auth.api.acceptInvite({
+            body: { token: "garbage", password: "password123", name: "Invitee" }
+          })
         )
       )?.status
     ).toBe("BAD_REQUEST");
@@ -431,7 +455,7 @@ describe("invite-only mode", () => {
     expect(
       (
         await captureError(() =>
-          auth.api.acceptInvite({ body: { token: t2, password: "password123" } })
+          auth.api.acceptInvite({ body: { token: t2, password: "password123", name: "Invitee" } })
         )
       )?.status
     ).toBe("BAD_REQUEST");
@@ -444,11 +468,11 @@ describe("invite-only mode", () => {
       body: { type: "private", email: "race@test.com", role: "user" },
       headers
     });
-    await auth.api.acceptInvite({ body: { token, password: "password123" } });
+    await auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } });
     expect(
       (
         await captureError(() =>
-          auth.api.acceptInvite({ body: { token, password: "password123" } })
+          auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } })
         )
       )?.status
     ).toBe("BAD_REQUEST");
@@ -458,8 +482,8 @@ describe("invite-only mode", () => {
       headers
     });
     const results = await Promise.allSettled([
-      auth.api.acceptInvite({ body: { token: t2, password: "password123" } }),
-      auth.api.acceptInvite({ body: { token: t2, password: "password123" } })
+      auth.api.acceptInvite({ body: { token: t2, password: "password123", name: "Invitee" } }),
+      auth.api.acceptInvite({ body: { token: t2, password: "password123", name: "Invitee" } })
     ]);
     const ok = results.filter((r) => r.status === "fulfilled");
     expect(ok).toHaveLength(1);
@@ -472,7 +496,7 @@ describe("invite-only mode", () => {
       body: { type: "private", email: "use@test.com", role: "user" },
       headers
     });
-    await auth.api.acceptInvite({ body: { token, password: "password123" } });
+    await auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } });
     const row = await findInviteRow(auth, inviteId);
     expect(row?.status).toBe("accepted");
     expect(row?.useCount).toBe(1);
@@ -537,20 +561,26 @@ describe("invite-only mode", () => {
       body: { type: "public", role: "user", maxUses: 2 },
       headers
     });
-    await auth.api.acceptInvite({ body: { token, password: "password123", email: "p1@test.com" } });
+    await auth.api.acceptInvite({
+      body: { token, password: "password123", email: "p1@test.com", name: "Invitee" }
+    });
     const u1 = await findUserByEmail(auth, "p1@test.com");
     expect(u1?.emailVerified).toBe(false);
 
     // A taken email is not confirmed to the caller; they are sent to sign-in.
     const dup = await auth.api.acceptInvite({
-      body: { token, password: "password123", email: "p1@test.com" }
+      body: { token, password: "password123", email: "p1@test.com", name: "Invitee" }
     });
     if (!("action" in dup)) throw new Error("expected a sign-in redirect");
     expect(dup.action).toBe("SIGN_IN_REQUIRED");
 
-    await auth.api.acceptInvite({ body: { token, password: "password123", email: "p2@test.com" } });
+    await auth.api.acceptInvite({
+      body: { token, password: "password123", email: "p2@test.com", name: "Invitee" }
+    });
     const over = await captureError(() =>
-      auth.api.acceptInvite({ body: { token, password: "password123", email: "p3@test.com" } })
+      auth.api.acceptInvite({
+        body: { token, password: "password123", email: "p3@test.com", name: "Invitee" }
+      })
     );
     expect(over?.status).toBe("BAD_REQUEST");
 
@@ -561,7 +591,7 @@ describe("invite-only mode", () => {
       headers: hV
     });
     await authV.api.acceptInvite({
-      body: { token: tV, password: "password123", email: "verified@test.com" }
+      body: { token: tV, password: "password123", email: "verified@test.com", name: "Invitee" }
     });
     expect((await findUserByEmail(authV, "verified@test.com"))?.emailVerified).toBe(true);
   });
@@ -576,7 +606,7 @@ describe("invite-only mode", () => {
     const results = await Promise.allSettled(
       Array.from({ length: 6 }, (_, i) =>
         auth.api.acceptInvite({
-          body: { token, password: "password123", email: `par${i}@test.com` }
+          body: { token, password: "password123", email: `par${i}@test.com`, name: "Invitee" }
         })
       )
     );
@@ -603,7 +633,7 @@ describe("invite-only mode", () => {
     expect(
       (
         await captureError(() =>
-          auth.api.acceptInvite({ body: { token, password: "password123" } })
+          auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } })
         )
       )?.status
     ).toBe("BAD_REQUEST");
@@ -632,7 +662,7 @@ describe("invite-only mode", () => {
       body: { type: "private", email: "perm@test.com", role: "user" },
       headers
     });
-    await auth.api.acceptInvite({ body: { token, password: "password123" } });
+    await auth.api.acceptInvite({ body: { token, password: "password123", name: "Invitee" } });
     expect(
       (await captureError(() => auth.api.deleteInvite({ body: { inviteId: acceptedId }, headers })))
         ?.status
@@ -770,7 +800,8 @@ describe("invite-only mode", () => {
       body: {
         token: created.token,
         password: "brand-new-pass-123",
-        email: "resident@test.com"
+        email: "resident@test.com",
+        name: "Invitee"
       }
     });
     expect(res.action).toBe("SIGN_IN_REQUIRED");

@@ -475,7 +475,7 @@ describe("org-join redemption (invite-only)", () => {
       headers: ownerHeaders
     });
     await api(auth).redeemInvite({
-      body: { token: withTeam.token, password: PASSWORD }
+      body: { token: withTeam.token, password: PASSWORD, name: "Invitee" }
     });
     const user = await findUserByEmail(auth, "eng@acme.com");
     const ctx = await auth.$context;
@@ -539,7 +539,7 @@ describe("org-join redemption (invite-only)", () => {
     });
 
     await api(auth).redeemInvite({
-      body: { token: created.token, password: PASSWORD }
+      body: { token: created.token, password: PASSWORD, name: "Invitee" }
     });
     const user = await findUserByEmail(auth, "late@acme.com");
     const member = await getMemberRow(auth, user!.id, org.id);
@@ -569,7 +569,7 @@ describe("org-join redemption (invite-only)", () => {
     expect(
       await errCode(
         api(auth).redeemInvite({
-          body: { token: created.token, password: PASSWORD }
+          body: { token: created.token, password: PASSWORD, name: "Invitee" }
         })
       )
     ).toBe("INVITE_NOT_FOUND");
@@ -732,7 +732,9 @@ describe("seat limits", () => {
     ).toBe("ORG_INVITE_NOT_ALLOWED");
 
     // The rotated link still redeems into the org.
-    await api(auth).redeemInvite({ body: { token: fresh.token, password: PASSWORD } });
+    await api(auth).redeemInvite({
+      body: { token: fresh.token, password: PASSWORD, name: "Invitee" }
+    });
     const user = await findUserByEmail(auth, "again@acme.com");
     const member = await getMemberRow(auth, user!.id, org.id);
     expect(member?.role).toBe("member");
@@ -766,7 +768,7 @@ describe("seat limits", () => {
     expect(
       await errCode(
         api(auth).redeemInvite({
-          body: { token: created.token, password: PASSWORD }
+          body: { token: created.token, password: PASSWORD, name: "Invitee" }
         })
       )
     ).toBe("SEAT_LIMIT_REACHED");
@@ -795,14 +797,16 @@ describe("seat limits", () => {
         body: {
           token: created.token,
           password: PASSWORD,
-          email: "race1@acme.com"
+          email: "race1@acme.com",
+          name: "Invitee"
         }
       }),
       api(auth).redeemInvite({
         body: {
           token: created.token,
           password: PASSWORD,
-          email: "race2@acme.com"
+          email: "race2@acme.com",
+          name: "Invitee"
         }
       })
     ]);
@@ -858,7 +862,8 @@ describe("org-create", () => {
         token: created.token,
         password: PASSWORD,
         organizationName: "NewCo",
-        organizationSlug: "NewCo"
+        organizationSlug: "NewCo",
+        name: "Invitee"
       }
     });
     expect(res.organization?.name).toBe("NewCo");
@@ -899,6 +904,7 @@ describe("org-create", () => {
           body: {
             token: created.token,
             password: PASSWORD,
+            name: "Invitee",
             organizationName: "Acme Again",
             organizationSlug: "acme" // taken by setupOrg
           }
@@ -910,7 +916,7 @@ describe("org-create", () => {
     expect(
       await errCode(
         api(auth).redeemInvite({
-          body: { token: created.token, password: PASSWORD }
+          body: { token: created.token, password: PASSWORD, name: "Invitee" }
         })
       )
     ).toBe("ORG_INFO_REQUIRED");
@@ -969,7 +975,8 @@ describe("org-create", () => {
         password: PASSWORD,
         email: "f1@a.com",
         organizationName: "Alpha",
-        organizationSlug: "alpha"
+        organizationSlug: "alpha",
+        name: "Invitee"
       }
     });
     await api(auth).redeemInvite({
@@ -978,7 +985,8 @@ describe("org-create", () => {
         password: PASSWORD,
         email: "f2@b.com",
         organizationName: "Beta",
-        organizationSlug: "beta"
+        organizationSlug: "beta",
+        name: "Invitee"
       }
     });
     const ctx = await auth.$context;
@@ -1001,7 +1009,8 @@ describe("org-create", () => {
         token: created.token,
         password: PASSWORD,
         organizationName: "Gated",
-        organizationSlug: "gated"
+        organizationSlug: "gated",
+        name: "Invitee"
       }
     });
     expect(res.organization?.slug).toBe("gated");
@@ -1020,7 +1029,8 @@ describe("org-create", () => {
           password: PASSWORD,
           email,
           organizationName: "Race Co",
-          organizationSlug: slug
+          organizationSlug: slug,
+          name: "Invitee"
         }
       });
     const results = await Promise.allSettled([
@@ -1042,7 +1052,8 @@ describe("org-create", () => {
         password: PASSWORD,
         email: loserEmail,
         organizationName: "Race Co Two",
-        organizationSlug: "race-co-2"
+        organizationSlug: "race-co-2",
+        name: "Invitee"
       }
     });
     expect(retry.organization?.slug).toBe("race-co-2");
@@ -1066,7 +1077,7 @@ describe("uniform redemption flow", () => {
     expect(info.kind).toBe("org-join");
     expect(info.organizationName).toBe("Acme");
     expect(info.nextAction).toBe("SIGN_UP");
-    expect(info.requiredFields).toEqual(["password"]);
+    expect(info.requiredFields).toEqual(["password", "name"]);
 
     const orgCreate = await createInvite(auth, {
       body: { kind: "org-create", type: "public", maxUses: 3 },
@@ -1077,6 +1088,7 @@ describe("uniform redemption flow", () => {
     });
     expect(info2.requiredFields).toEqual([
       "password",
+      "name",
       "email",
       "organizationName",
       "organizationSlug"
@@ -1128,7 +1140,7 @@ describe("uniform redemption flow", () => {
     });
     const headers = await signInHeaders(auth, "activator@acme.com", PASSWORD);
     const res = await api(auth).redeemInvite({
-      body: { token: created.token },
+      body: { token: created.token, name: "Invitee" },
       headers
     });
     expect(res.action).toBe("ACCEPTED");
@@ -1153,7 +1165,7 @@ describe("uniform redemption flow", () => {
       role: "user"
     });
     const headers = await signInHeaders(auth, "untouched@acme.com", PASSWORD);
-    await api(auth).redeemInvite({ body: { token: created.token }, headers });
+    await api(auth).redeemInvite({ body: { token: created.token, name: "Invitee" }, headers });
 
     // Membership was written, but the session the user redeemed with was
     // not switched to the new org; that choice belongs to the app.
@@ -1181,7 +1193,7 @@ describe("uniform redemption flow", () => {
       headers: ownerHeaders
     });
     await api(auth).redeemInvite({
-      body: { token: created.token, password: PASSWORD }
+      body: { token: created.token, password: PASSWORD, name: "Invitee" }
     });
     const headers = await signInHeaders(auth, "fresh@acme.com", PASSWORD);
     expect(headers.get("cookie")).toBeTruthy();
@@ -1227,7 +1239,7 @@ describe("uniform redemption flow", () => {
       headers: ownerHeaders
     });
     const res = await api(auth).redeemInvite({
-      body: { token: created.token },
+      body: { token: created.token, name: "Invitee" },
       headers: existing.headers
     });
     expect(res.action).toBe("ACCEPTED");
@@ -1287,7 +1299,7 @@ describe("platform controls", () => {
     expect(
       await errCode(
         api(auth).redeemInvite({
-          body: { token: pending.token, password: PASSWORD }
+          body: { token: pending.token, password: PASSWORD, name: "Invitee" }
         })
       )
     ).toBe("ORG_DISABLED");
@@ -1306,7 +1318,7 @@ describe("platform controls", () => {
     });
     expect(events).toContain("enabled");
     const res = await api(auth).redeemInvite({
-      body: { token: pending.token, password: PASSWORD }
+      body: { token: pending.token, password: PASSWORD, name: "Invitee" }
     });
     expect(res.organization?.id).toBe(org.id);
   });
@@ -1468,7 +1480,7 @@ describe("platform controls", () => {
     expect(
       await errCode(
         api(auth).redeemInvite({
-          body: { token: other.token, password: PASSWORD }
+          body: { token: other.token, password: PASSWORD, name: "Invitee" }
         })
       )
     ).toBe("USER_BANNED");
@@ -1485,7 +1497,7 @@ describe("platform controls", () => {
       headers: ownerHeaders
     });
     await api(auth).redeemInvite({
-      body: { token: accepted.token, password: PASSWORD }
+      body: { token: accepted.token, password: PASSWORD, name: "Invitee" }
     });
     const pending = await createInvite(auth, {
       body: {
@@ -1615,7 +1627,7 @@ describe("existing-user activation invites (invite-only)", () => {
     expect(signedIn.nextAction).toBe("CONFIRM");
 
     const res = await api(auth).redeemInvite({
-      body: { token: created.token },
+      body: { token: created.token, name: "Invitee" },
       headers
     });
     expect(res.action).toBe("ACCEPTED");
@@ -1636,7 +1648,7 @@ describe("existing-user activation invites (invite-only)", () => {
     expect(
       await errCode(
         api(auth).redeemInvite({
-          body: { token: created.token },
+          body: { token: created.token, name: "Invitee" },
           headers: sneakHeaders
         })
       )
@@ -1655,7 +1667,7 @@ describe("existing-user activation invites (invite-only)", () => {
       headers: ownerHeaders
     });
     const res = await api(auth).acceptInvite({
-      body: { token: created.token, password: "attacker-pass-999" }
+      body: { token: created.token, password: "attacker-pass-999", name: "Invitee" }
     });
     expect(res.action).toBe("SIGN_IN_REQUIRED");
     expect(res.callbackURL).toContain(created.token);
@@ -1665,7 +1677,7 @@ describe("existing-user activation invites (invite-only)", () => {
     expect((await findInviteRow(auth, created.inviteId))?.useCount).toBe(0);
     const headers = await signInHeaders(auth, "dana@app.com", "dana-real-password");
     const redeemed = await api(auth).redeemInvite({
-      body: { token: created.token },
+      body: { token: created.token, name: "Invitee" },
       headers
     });
     expect(redeemed.action).toBe("ACCEPTED");
@@ -1707,7 +1719,7 @@ describe("existing-user activation invites (invite-only)", () => {
     });
     expect(info.nextAction).toBe("CONFIRM");
     const res = await api(auth).redeemInvite({
-      body: { token: created.token },
+      body: { token: created.token, name: "Invitee" },
       headers
     });
     expect(res.action).toBe("ACCEPTED");

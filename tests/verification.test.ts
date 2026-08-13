@@ -32,7 +32,12 @@ describe("public-invite email verification", () => {
       headers
     });
     await auth.api.acceptInvite({
-      body: { token: invite.token, password: "password123", email: "public@test.com" }
+      body: {
+        token: invite.token,
+        password: "password123",
+        email: "public@test.com",
+        name: "Invitee"
+      }
     });
 
     const user = await findUserByEmail(auth, "public@test.com");
@@ -60,7 +65,12 @@ describe("public-invite email verification", () => {
       headers
     });
     await auth.api.acceptInvite({
-      body: { token: invite.token, password: "password123", email: "public@test.com" }
+      body: {
+        token: invite.token,
+        password: "password123",
+        email: "public@test.com",
+        name: "Invitee"
+      }
     });
     expect(sent).toHaveLength(1);
   });
@@ -77,7 +87,12 @@ describe("public-invite email verification", () => {
       headers
     });
     await auth.api.acceptInvite({
-      body: { token: invite.token, password: "password123", email: "public@test.com" }
+      body: {
+        token: invite.token,
+        password: "password123",
+        email: "public@test.com",
+        name: "Invitee"
+      }
     });
     const user = await findUserByEmail(auth, "public@test.com");
     expect(user?.emailVerified).toBe(true);
@@ -95,7 +110,7 @@ describe("public-invite email verification", () => {
       headers
     });
     await auth.api.acceptInvite({
-      body: { token: invite.token, password: "password123" }
+      body: { token: invite.token, password: "password123", name: "Invitee" }
     });
     const user = await findUserByEmail(auth, "private@test.com");
     expect(user?.emailVerified).toBe(true);
