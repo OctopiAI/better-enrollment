@@ -417,21 +417,32 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     });
   }
 
-  async function rollbackClaim(
-    ctx: GenericEndpointContext,
-    invite: Invite,
-    claimed: Invite
-  ): Promise<void> {
+  async function rollbackClaim(ctx: GenericEndpointContext, invite: Invite): Promise<void> {
     try {
+      // Return exactly this claim's +1. No snapshot CAS: under parallel
+      // claims the live count differs from this claimer's snapshot, and a
+      // rollback that silently matches nothing strands the invite.
       await ctx.context.adapter.incrementOne({
         model: "invite",
         where: [
           { field: "id", value: invite.id },
-          { field: "status", value: claimed.status },
-          { field: "useCount", value: claimed.useCount }
+          { field: "useCount", value: 0, operator: "gt" as const }
         ],
         increment: { useCount: -1 },
-        set: { status: "pending", updatedAt: new Date() }
+        set: { updatedAt: new Date() }
+      });
+      // Reopen a settle or single-use flip, never a revocation, and only
+      // while the freed seat actually exists.
+      await ctx.context.adapter.update({
+        model: "invite",
+        where: [
+          { field: "id", value: invite.id },
+          { field: "status", value: "accepted" },
+          ...(invite.maxUses != null
+            ? [{ field: "useCount", value: invite.maxUses, operator: "lt" as const }]
+            : [])
+        ],
+        update: { status: "pending", updatedAt: new Date() }
       });
     } catch (e) {
       ctx.context.logger.error(`better-enrollment: claim rollback failed: ${String(e)}`);
@@ -462,7 +473,10 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         model: "invite",
         where: [
           { field: "id", value: claimed.id },
-          { field: "status", value: "pending" }
+          { field: "status", value: "pending" },
+          // Guard on the live count, not this claimer's snapshot: a
+          // parallel loser may have rolled its use back since.
+          { field: "useCount", value: claimed.maxUses, operator: "gte" as const }
         ],
         update: { status: "accepted", updatedAt: new Date() }
       });
@@ -1024,11 +1038,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
             );
           }
         }
-        await rollbackClaim(ctx, invite, {
-          ...invite,
-          status: "accepted",
-          useCount: invite.useCount + 1
-        });
+        await rollbackClaim(ctx, invite);
         throw e;
       }
     }
@@ -1135,7 +1145,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           );
         }
       }
-      await rollbackClaim(ctx, invite, claimed);
+      await rollbackClaim(ctx, invite);
       throw e;
     }
   }
@@ -1211,7 +1221,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         organization: org ? { id: org.id, name: org.name, slug: org.slug } : null
       });
     } catch (e) {
-      await rollbackClaim(ctx, invite, claimed);
+      await rollbackClaim(ctx, invite);
       throw e;
     }
   }
