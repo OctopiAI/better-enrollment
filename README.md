@@ -292,7 +292,10 @@ betterEnrollment({
   validRoles: ["user", "admin"],
   defaultRole: "user",
   expiresIn: 60 * 60 * 24 * 7,
+  ac, // the admin plugin's access-control file, shared as-is
+  roles, // roles with invite:<action> grants; falls back to adminRoles below
   adminRoles: ["admin"],
+  passwordless: "auto", // magic-link apps: accept invites without a password
   additionalFields: {/* extra sign-up fields, see docs */},
   buildInviteUrl,
   organization: {/* ... */},

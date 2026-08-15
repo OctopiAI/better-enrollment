@@ -15,6 +15,7 @@ import {
 } from "better-auth/api";
 import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
+import { defaultInviteRoles, type InviteManagementAction } from "./access";
 import { buildSchema } from "./schema";
 import {
   INVITE_ERROR_CODES,
@@ -28,18 +29,22 @@ import {
   type InviteUse,
   type MemberRecord,
   type OrganizationRecord,
+  type OrgRoleLike,
   type TeamRecord
 } from "./types";
+import { setSessionCookie } from "better-auth/cookies";
 import {
   deriveStatus,
   isExpired,
   maskEmail,
   mergeRoles,
   reservedSeats,
+  sha256Base64Url,
   splitRoles,
   storedTokenValue
 } from "./utils";
 
+export * from "./access";
 export * from "./types";
 export { roleGate } from "./utils";
 
@@ -91,6 +96,13 @@ type OrgPrecheck = {
   orgInput?: { name: string; slug: string };
 };
 
+/** The magic-link plugin config this plugin reads off the plugin object. */
+type MagicLinkLikeOptions = {
+  disableSignUp?: boolean;
+  storeToken?:
+    "plain" | "hashed" | { type: "custom-hasher"; hash: (token: string) => Promise<string> };
+};
+
 function unwrapUser(result: MaybeWithAccounts | null): User | null {
   if (!result) return null;
   return "user" in result ? result.user : result;
@@ -118,6 +130,13 @@ function detectSignupPaths(options: BetterAuthOptions): SignupPath[] {
       paths.push({ name, open: true });
     }
   }
+  // The magic-link plugin exposes its options on the plugin object, so
+  // this sign-up path is detectable, unlike most third-party plugins.
+  const magicLink = options.plugins?.find((p) => p.id === "magic-link") as
+    { options?: MagicLinkLikeOptions } | undefined;
+  if (magicLink) {
+    paths.push({ name: "magic-link", open: !magicLink.options?.disableSignUp });
+  }
   return paths;
 }
 
@@ -137,6 +156,8 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     defaultRole: "user",
     expiresIn: DEFAULT_EXPIRES_IN,
     publicExpiresIn: DEFAULT_EXPIRES_IN as number | null,
+    passwordless: "auto" as const,
+    passwordlessVerifyPaths: ["/magic-link/verify"],
     hashTokens: true,
     autoVerifyPublicInviteEmail: false,
     exposeEmailOnGet: false,
@@ -232,7 +253,11 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
   const state = {
     mode: (opts.mode === "auto" ? null : opts.mode) as InviteMode | null,
-    orgPluginPresent: false
+    orgPluginPresent: false,
+    // Resolved at init from the magic-link plugin and emailAndPassword.
+    passwordless: false,
+    credentialEnabled: false,
+    magicLinkOptions: null as MagicLinkLikeOptions | null
   };
   const getMode = (): InviteMode => {
     if (!state.mode) {
@@ -260,6 +285,25 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     });
   }
 
+  /**
+   * True when a non-accepted invite-only invite still owns a pre-created
+   * shell for this email. Shells enter only through their invite; both
+   * magic-link guards key on this.
+   */
+  async function hasPendingShellInvite(
+    ctx: GenericEndpointContext,
+    email: string
+  ): Promise<boolean> {
+    const invites = await ctx.context.adapter.findMany<Invite>({
+      model: "invite",
+      where: [
+        { field: "email", value: email.toLowerCase() },
+        { field: "mode", value: "invite-only" }
+      ]
+    });
+    return invites.some((i) => i.status !== "accepted" && i.preCreatedUserId);
+  }
+
   function buildInviteUrl(ctx: GenericEndpointContext, token: string, type: InviteType): string {
     if (opts.buildInviteUrl) {
       return opts.buildInviteUrl({ token, type, mode: getMode() });
@@ -283,7 +327,24 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     return user;
   }
 
-  async function isInviteAdmin(user: BannableUser): Promise<boolean> {
+  // AC mode engages when the app hands over its admin-plugin permission
+  // file. `roles` alone works; `ac` alone falls back to defaultInviteRoles.
+  const acMode = !!(opts.roles || opts.ac);
+  const inviteAcRoles: Record<string, OrgRoleLike | undefined> = opts.roles ?? defaultInviteRoles;
+  const acResource = opts.permissionResource ?? "invite";
+
+  async function isInviteAdmin(
+    user: BannableUser,
+    action: InviteManagementAction
+  ): Promise<boolean> {
+    if (acMode) {
+      // Mirrors the admin plugin's hasPermission: adminUserIds bypass,
+      // then each held role is asked for <resource>:<action>.
+      if (opts.adminUserIds.includes(user.id)) return true;
+      const roles = splitRoles(user.role);
+      if (roles.length === 0) roles.push(opts.defaultRole);
+      return roles.some((r) => !!inviteAcRoles[r]?.authorize({ [acResource]: [action] }).success);
+    }
     if (opts.canManageInvites) {
       return await opts.canManageInvites(user);
     }
@@ -293,9 +354,12 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     );
   }
 
-  async function requireInviteAdmin(ctx: GenericEndpointContext): Promise<BannableUser> {
+  async function requireInviteAdmin(
+    ctx: GenericEndpointContext,
+    action: InviteManagementAction
+  ): Promise<BannableUser> {
     const user = await getAuthUser(ctx);
-    if (!(await isInviteAdmin(user))) {
+    if (!(await isInviteAdmin(user, action))) {
       throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
     }
     return user;
@@ -498,8 +562,10 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           continue;
         }
       }
-      // Org plugin defaults: owner and admin hold invitation create/cancel.
-      if (name === "owner" || name === "admin") return true;
+      // Org plugin defaults apply only when no roles record was given,
+      // mirroring its hasPermission (options.roles || defaultRoles):
+      // owner and admin hold invitation create/cancel.
+      if (!orgOpts?.roles && (name === "owner" || name === "admin")) return true;
     }
     const dynamic = await dynamicOrgRoles(ctx, member.organizationId);
     for (const row of dynamic) {
@@ -820,14 +886,20 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     const invite = await assertUsable(await findInviteByToken(ctx, body.token));
     const role = await resolveRole(invite);
 
-    if (!body.password) {
+    if (body.password) {
+      // A password field on a passwordless app misleads the accepter into
+      // thinking they set one; reject instead of silently dropping it.
+      if (!state.credentialEnabled) {
+        throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.PASSWORD_NOT_AVAILABLE);
+      }
+      const { minPasswordLength, maxPasswordLength } = ctx.context.password.config;
+      if (body.password.length < minPasswordLength || body.password.length > maxPasswordLength) {
+        throw new APIError("BAD_REQUEST", {
+          message: `Password must be between ${minPasswordLength} and ${maxPasswordLength} characters`
+        });
+      }
+    } else if (!state.passwordless) {
       throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.PASSWORD_REQUIRED);
-    }
-    const { minPasswordLength, maxPasswordLength } = ctx.context.password.config;
-    if (body.password.length < minPasswordLength || body.password.length > maxPasswordLength) {
-      throw new APIError("BAD_REQUEST", {
-        message: `Password must be between ${minPasswordLength} and ${maxPasswordLength} characters`
-      });
     }
     // The accept flow exists to populate the profile; a nameless profile
     // defeats it. Activation flows never reach this path.
@@ -859,9 +931,11 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       // the invite's own pre-created shell is claimable through accept, so
       // a retry whose earlier attempt already wrote the credential still
       // passes, while accounts somebody owns are routed to sign-in.
+      // emailVerified counts as established too: magic-link users own zero
+      // account rows, so account count alone would misread them as shells.
       if (!invite.preCreatedUserId) {
         const targetAccounts = await ctx.context.internalAdapter.findAccounts(target.id);
-        if (targetAccounts.length > 0) {
+        if (targetAccounts.length > 0 || target.emailVerified) {
           return ctx.json({
             action: "SIGN_IN_REQUIRED" as const,
             callbackURL: buildInviteUrl(ctx, body.token, invite.type)
@@ -872,32 +946,35 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       if (!claimed) {
         throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_ALREADY_USED);
       }
+      let sessionCreated = false;
       try {
-        const hash = await ctx.context.password.hash(body.password);
-        // Idempotent on retry: a prior attempt may have created the
-        // credential account before failing later in the flow.
-        const priorCredential = await ctx.context.adapter.findOne<{
-          id: string;
-        }>({
-          model: "account",
-          where: [
-            { field: "userId", value: target.id },
-            { field: "providerId", value: "credential" }
-          ]
-        });
-        if (priorCredential) {
-          await ctx.context.adapter.update({
+        if (body.password) {
+          const hash = await ctx.context.password.hash(body.password);
+          // Idempotent on retry: a prior attempt may have created the
+          // credential account before failing later in the flow.
+          const priorCredential = await ctx.context.adapter.findOne<{
+            id: string;
+          }>({
             model: "account",
-            where: [{ field: "id", value: priorCredential.id }],
-            update: { password: hash }
+            where: [
+              { field: "userId", value: target.id },
+              { field: "providerId", value: "credential" }
+            ]
           });
-        } else {
-          await ctx.context.internalAdapter.createAccount({
-            userId: target.id,
-            providerId: "credential",
-            accountId: target.id,
-            password: hash
-          });
+          if (priorCredential) {
+            await ctx.context.adapter.update({
+              model: "account",
+              where: [{ field: "id", value: priorCredential.id }],
+              update: { password: hash }
+            });
+          } else {
+            await ctx.context.internalAdapter.createAccount({
+              userId: target.id,
+              providerId: "credential",
+              accountId: target.id,
+              password: hash
+            });
+          }
         }
         const updated =
           (await ctx.context.internalAdapter.updateUser(target.id, {
@@ -908,12 +985,22 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })) ?? target;
         const org = await applyOrgEffects(ctx, claimed, updated, pre);
         await recordUse(ctx, invite, target.id, target.email);
+        // With a password, no session is created or mutated: the accepter
+        // signs in through the app's own flow with the credentials they
+        // just set. Passwordless has no credential to sign in with, and
+        // the emailed token already proved the mailbox, so the accepter
+        // is signed in directly instead of a second email round trip.
+        let signedIn = false;
+        if (!body.password) {
+          const session = await ctx.context.internalAdapter.createSession(updated.id);
+          sessionCreated = true;
+          await setSessionCookie(ctx, { session, user: updated });
+          signedIn = true;
+        }
         await opts.onInviteAccepted?.({ invite: claimed, user: updated });
-        // No session is created or mutated: the accepter signs in through
-        // the app's own flow with the credentials they just set, and the
-        // app decides the active organization there.
         return ctx.json({
           action: "ACCEPTED" as const,
+          signedIn,
           user: {
             id: updated.id,
             email: updated.email,
@@ -923,6 +1010,20 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           organization: org ? { id: org.id, name: org.name, slug: org.slug } : null
         });
       } catch (e) {
+        // A rolled-back invite must not leave a live session behind: the
+        // shell had none before, so deleting all of its sessions is exact.
+        if (sessionCreated) {
+          try {
+            await ctx.context.adapter.deleteMany({
+              model: "session",
+              where: [{ field: "userId", value: target.id }]
+            });
+          } catch (cleanupError) {
+            ctx.context.logger.error(
+              `better-enrollment: failed to remove session after failed redemption: ${String(cleanupError)}`
+            );
+          }
+        }
         await rollbackClaim(ctx, invite, {
           ...invite,
           status: "accepted",
@@ -964,13 +1065,15 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         ...extraFields
       });
       createdUserId = user.id;
-      const hash = await ctx.context.password.hash(body.password);
-      await ctx.context.internalAdapter.createAccount({
-        userId: user.id,
-        providerId: "credential",
-        accountId: user.id,
-        password: hash
-      });
+      if (body.password) {
+        const hash = await ctx.context.password.hash(body.password);
+        await ctx.context.internalAdapter.createAccount({
+          userId: user.id,
+          providerId: "credential",
+          accountId: user.id,
+          password: hash
+        });
+      }
       // Redemption bypasses the sign-up route, so its sendOnSignUp logic
       // never runs; mirror its trigger here or the unverified accepter
       // would never receive a verification email.
@@ -997,10 +1100,13 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       await recordUse(ctx, invite, user.id, email);
       await settlePublicStatus(ctx, claimed);
       await opts.onInviteAccepted?.({ invite: claimed, user });
-      // No session is created or mutated: the accepter signs in through
-      // the app's own flow with the credentials they just set.
+      // No session is created or mutated, even passwordless: a public link
+      // proves nothing about the mailbox, so the accepter signs in through
+      // the app's own flow (credentials just set, or their first magic
+      // link, which also verifies the email).
       return ctx.json({
         action: "ACCEPTED" as const,
+        signedIn: false,
         user: {
           id: user.id,
           email: user.email,
@@ -1243,7 +1349,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       }
     } else {
       if (actor.type === "user") {
-        creator = await requireInviteAdmin(ctx);
+        creator = await requireInviteAdmin(ctx, "create");
       }
       if (body.organizationId || body.organizationRole || body.teamId) {
         throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.ORG_FIELDS_NOT_ALLOWED);
@@ -1456,6 +1562,20 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         }
       }
 
+      const magicLinkPlugin = ctx.options.plugins?.find((p) => p.id === "magic-link") as
+        { options?: MagicLinkLikeOptions } | undefined;
+      state.magicLinkOptions = magicLinkPlugin ? (magicLinkPlugin.options ?? {}) : null;
+      state.credentialEnabled = !!ctx.options.emailAndPassword?.enabled;
+      state.passwordless =
+        opts.passwordless === "auto"
+          ? !!magicLinkPlugin && !state.credentialEnabled
+          : opts.passwordless;
+      if (state.passwordless) {
+        ctx.logger.info(
+          "better-enrollment: passwordless redemption active. Accept works without a password; private accepters are signed in directly."
+        );
+      }
+
       const orgPlugin = ctx.options.plugins?.find((p) => p.id === "organization");
       state.orgPluginPresent = !!orgPlugin;
       if (orgOpts && !orgPlugin) {
@@ -1514,6 +1634,38 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
                   }
                 }
               }
+            },
+            session: {
+              create: {
+                // Backstop behind the /magic-link/verify request guard:
+                // catches passwordless verify flows the guard cannot
+                // resolve (custom paths, storeToken drift). Path-gated so
+                // ordinary sign-ins pay zero queries.
+                before: async (session, context) => {
+                  if (state.mode !== "invite-only") return;
+                  const path = context?.path;
+                  if (!path || !opts.passwordlessVerifyPaths.includes(path)) return;
+                  const userId = (session as { userId: string }).userId;
+                  const invites = await context.context.adapter.findMany<Invite>({
+                    model: "invite",
+                    where: [
+                      { field: "preCreatedUserId", value: userId },
+                      { field: "mode", value: "invite-only" }
+                    ]
+                  });
+                  if (invites.some((i) => i.status !== "accepted")) {
+                    // Verify already flipped emailVerified before this
+                    // hook; undo it so the shell stays inert and
+                    // deletable, then refuse the session.
+                    await context.context.adapter.update({
+                      model: "user",
+                      where: [{ field: "id", value: userId }],
+                      update: { emailVerified: false }
+                    });
+                    throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.INVITATION_REQUIRED);
+                  }
+                }
+              }
             }
           }
         } satisfies Partial<BetterAuthOptions>
@@ -1558,6 +1710,61 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
                   headers: { "content-type": "application/json" }
                 }
               );
+            }
+          })
+        },
+        {
+          // Magic-link verify signs in EXISTING users regardless of its
+          // disableSignUp, and a pre-created invite shell exists. Without
+          // this guard the invitee could skip the invite flow entirely.
+          // The token is resolved to its email without consuming it, using
+          // the same storeToken transform the magic-link plugin configured.
+          matcher: (ctx) => ctx.path === "/magic-link/verify",
+          handler: createAuthMiddleware(async (ctx) => {
+            if (state.mode !== "invite-only" || !state.magicLinkOptions) return;
+            const token = (ctx.query as { token?: string } | undefined)?.token;
+            if (!token) return;
+            const st = state.magicLinkOptions.storeToken ?? "plain";
+            let identifier = token;
+            if (st === "hashed") {
+              identifier = await sha256Base64Url(token);
+            } else if (typeof st === "object" && st.type === "custom-hasher") {
+              identifier = await st.hash(token);
+            }
+            const verification = await ctx.context.adapter.findOne<{ value: string }>({
+              model: "verification",
+              where: [{ field: "identifier", value: identifier }]
+            });
+            if (!verification) return;
+            let email: string | undefined;
+            try {
+              email = (JSON.parse(verification.value) as { email?: string }).email;
+            } catch {
+              return;
+            }
+            if (!email) return;
+            // Only pre-created shells are locked; activation invites
+            // (existing accounts) must not break their owner's sign-in.
+            if (await hasPendingShellInvite(ctx, email)) {
+              throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.INVITATION_REQUIRED);
+            }
+          })
+        },
+        {
+          // Sending a magic link to a pre-created shell would deliver a
+          // link the verify guard rejects. Reply with the endpoint's exact
+          // success body without sending, mirroring the password-reset
+          // guard: no dead link in the inbox, no invite oracle.
+          matcher: (ctx) => ctx.path === "/sign-in/magic-link",
+          handler: createAuthMiddleware(async (ctx) => {
+            if (state.mode !== "invite-only" || !state.magicLinkOptions) return;
+            const email = (ctx.body as { email?: string } | undefined)?.email?.toLowerCase().trim();
+            if (!email) return;
+            if (await hasPendingShellInvite(ctx, email)) {
+              return new Response(JSON.stringify({ status: true }), {
+                status: 200,
+                headers: { "content-type": "application/json" }
+              });
             }
           })
         },
@@ -1749,7 +1956,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           // App admin is a moderation backstop; org members need
           // invitation:create in the invite's org, mirroring creation.
           let org: OrganizationRecord | null = null;
-          if (!(await isInviteAdmin(user))) {
+          if (!(await isInviteAdmin(user, "resend"))) {
             if (!orgEnabled() || !invite.organizationId) {
               throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
             }
@@ -1849,7 +2056,9 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           // keys and are validated by parseAdditionalFields.
           body: z.looseObject({
             token: z.string().min(1),
-            password: z.string().min(1),
+            // Optional at the schema level; acceptCore requires it unless
+            // passwordless redemption is active.
+            password: z.string().min(1).optional(),
             name: z.string().max(200).optional(),
             email: z.email().optional(),
             organizationName: z.string().max(200).optional(),
@@ -1966,7 +2175,8 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           const requiredFields: string[] = [];
           const optionalFields: string[] = [];
           if (nextAction === "SIGN_UP") {
-            requiredFields.push("password", "name");
+            if (!state.passwordless) requiredFields.push("password");
+            requiredFields.push("name");
             if (invite.type === "public") requiredFields.push("email");
           }
           if (formAction) {
@@ -2002,6 +2212,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
             status,
             organizationName,
             nextAction,
+            passwordless: state.passwordless,
             requiredFields,
             optionalFields,
             additionalFields,
@@ -2063,7 +2274,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         },
         async (ctx) => {
           const user = await getAuthUser(ctx);
-          const admin = await isInviteAdmin(user);
+          const admin = await isInviteAdmin(user, "list");
           const now = new Date();
           const where = [
             ...(ctx.query.type ? [{ field: "type", value: ctx.query.type }] : []),
@@ -2160,7 +2371,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           }
           // App admin is a moderation backstop; org members need
           // invitation:cancel in the invite's org.
-          if (!(await isInviteAdmin(user))) {
+          if (!(await isInviteAdmin(user, "cancel"))) {
             if (!orgEnabled() || !invite.organizationId) {
               throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
             }
@@ -2206,7 +2417,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           if (!invite) {
             throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
           }
-          if (!(await isInviteAdmin(user))) {
+          if (!(await isInviteAdmin(user, "delete"))) {
             if (!orgEnabled() || !invite.organizationId) {
               throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
             }
@@ -2235,7 +2446,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })
         },
         async (ctx) => {
-          await requireInviteAdmin(ctx);
+          await requireInviteAdmin(ctx, "manage-orgs");
           await requireOrgFeatures();
           const org = await findOrg(ctx, ctx.body.organizationId);
           if (!org) {
@@ -2263,7 +2474,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           await requireOrgFeatures();
           const user = await getAuthUser(ctx);
           let org: OrganizationRecord | null;
-          if (await isInviteAdmin(user)) {
+          if (await isInviteAdmin(user, "list")) {
             org = await findOrg(ctx, ctx.query.organizationId);
             if (!org) {
               throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ORG_NOT_FOUND);
@@ -2299,7 +2510,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })
         },
         async (ctx) => {
-          await requireInviteAdmin(ctx);
+          await requireInviteAdmin(ctx, "manage-orgs");
           await requireOrgFeatures();
           const org = await findOrg(ctx, ctx.body.organizationId);
           if (!org) {
@@ -2330,7 +2541,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })
         },
         async (ctx) => {
-          await requireInviteAdmin(ctx);
+          await requireInviteAdmin(ctx, "manage-orgs");
           await requireOrgFeatures();
           const org = await findOrg(ctx, ctx.body.organizationId);
           if (!org) {
@@ -2359,7 +2570,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })
         },
         async (ctx) => {
-          await requireInviteAdmin(ctx);
+          await requireInviteAdmin(ctx, "manage-orgs");
           await requireOrgFeatures();
           const org = await findOrg(ctx, ctx.body.organizationId);
           if (!org) {

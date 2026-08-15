@@ -116,12 +116,16 @@ export interface InviteAdditionalField {
   validator?: { input?: StandardSchemaLike };
 }
 
-/** Structural type for roles built with createAccessControl().newRole(). */
+/**
+ * Structural type for roles built with createAccessControl().newRole().
+ * Declared with method syntax so concrete Role objects, whose authorize
+ * parameter is a narrower statement-typed request, remain assignable.
+ */
 export interface OrgRoleLike {
-  authorize: (
+  authorize(
     permissions: Record<string, string[]>,
     connector?: "OR" | "AND"
-  ) => { success: boolean; error?: string };
+  ): { success: boolean; error?: string };
 }
 
 export interface PrivateInvitationEmailData {
@@ -157,6 +161,8 @@ export interface BetterEnrollmentOrgOptions {
   /**
    * The same roles record passed to the org plugin. When omitted, the org
    * plugin defaults apply: owner and admin hold invitation create/cancel.
+   * When provided, it fully replaces those defaults, mirroring the org
+   * plugin's own permission resolution.
    */
   roles?: Record<string, OrgRoleLike>;
   /** Overrides the invitation:create permission check for org-join creation. */
@@ -233,6 +239,21 @@ export interface BetterEnrollmentOptions {
   publicExpiresIn?: number | null;
 
   /**
+   * Passwordless redemption for magic-link apps. "auto" (default) turns it
+   * on when the magic-link plugin is registered and emailAndPassword is
+   * not enabled. When active, accept works without a password: private
+   * invites also sign the accepter in (the emailed token proves the
+   * mailbox); public accepters sign in with their first magic link.
+   */
+  passwordless?: boolean | "auto";
+  /**
+   * Sign-in verification paths guarded against pre-created invite shells,
+   * for the session backstop hook. Default ["/magic-link/verify"]. Add
+   * other passwordless plugins' verify paths here.
+   */
+  passwordlessVerifyPaths?: string[];
+
+  /**
    * Hash invite tokens at rest with SHA-256 (default true). Set false to
    * store raw tokens (not recommended; a DB leak then exposes live links).
    */
@@ -246,11 +267,39 @@ export interface BetterEnrollmentOptions {
   /** Return the full invitee email from GET /invite/get. Default: masked. */
   exposeEmailOnGet?: boolean;
 
-  /** Roles allowed to manage invites. Default ["admin"]. */
+  /**
+   * The access controller from your shared permissions file, the same one
+   * passed to the admin plugin. Accepted for config parity; the permission
+   * checks read `roles`. Setting it (without `roles`) switches the gate to
+   * the built-in defaultInviteRoles.
+   */
+  ac?: unknown;
+  /**
+   * The same roles record passed to the admin plugin, built from a
+   * statement object that spreads in inviteStatements. When set, it is the
+   * highest-priority invite gate: a role must grant `invite: [<action>]`
+   * (create, resend, list, cancel, delete, manage-orgs) for the matching
+   * endpoints. adminUserIds still bypasses, mirroring the admin plugin;
+   * canManageInvites and adminRoles are then ignored.
+   */
+  roles?: { [role: string]: OrgRoleLike | undefined };
+  /**
+   * The statement resource the AC check authorizes against. Default
+   * "invite" (the shape of the exported inviteStatements). Point it at
+   * your own resource ("enrollment", "invitations", ...) if your AC file
+   * already names one; the action verbs stay create, resend, list,
+   * cancel, delete, manage-orgs. Only meaningful together with `roles`:
+   * the built-in defaultInviteRoles grant under "invite".
+   */
+  permissionResource?: string;
+  /** Roles allowed to manage invites when `roles` is not set. Default ["admin"]. */
   adminRoles?: string[];
   /** User ids that may always manage invites. */
   adminUserIds?: string[];
-  /** Custom gate. When set, replaces adminRoles/adminUserIds entirely. */
+  /**
+   * Custom gate. When set (and `roles` is not), replaces
+   * adminRoles/adminUserIds entirely.
+   */
   canManageInvites?: (user: User & { role?: string | null }) => Promise<boolean> | boolean;
 
   /**
@@ -352,6 +401,10 @@ export const INVITE_ERROR_CODES = {
     "An invitation link is required to activate your account"
   ),
   PASSWORD_REQUIRED: err("PASSWORD_REQUIRED", "A password is required to accept this invitation"),
+  PASSWORD_NOT_AVAILABLE: err(
+    "PASSWORD_NOT_AVAILABLE",
+    "This app does not use passwords; accept the invitation without one"
+  ),
   NAME_REQUIRED: err("NAME_REQUIRED", "A name is required to accept this invitation"),
   ADDITIONAL_FIELD_REQUIRED: err("ADDITIONAL_FIELD_REQUIRED", "A required field is missing"),
   ADDITIONAL_FIELD_INVALID: err("ADDITIONAL_FIELD_INVALID", "A field value failed validation"),
