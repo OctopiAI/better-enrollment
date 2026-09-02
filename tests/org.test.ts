@@ -1697,6 +1697,185 @@ describe("existing-user activation invites (invite-only)", () => {
     ).toBe("USER_ALREADY_EXISTS");
   });
 
+  it("expired app invite, then org-join: the invitee signs up and joins in one go, and the stale invite is handed over", async () => {
+    const { auth, adminHeaders, ownerHeaders, org } = await setupOrg();
+    const appInvite = await createInvite(auth, {
+      body: { kind: "app", email: "stuck@app.com", role: "partner" },
+      headers: adminHeaders
+    });
+    await expireInvite(auth, appInvite.inviteId);
+
+    // The org owner cannot touch the app invite; creation must not need them to.
+    const orgInvite = await createInvite(auth, {
+      body: { kind: "org-join", email: "stuck@app.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    expect((await findInviteRow(auth, orgInvite.inviteId))?.preCreatedUserId).toBeFalsy();
+
+    // One link, one form: the shell is inert, so the page renders sign-up.
+    const got = await api(auth).getInvite({ query: { token: orgInvite.token } });
+    expect(got.nextAction).toBe("SIGN_UP");
+    expect(got.requiredFields).toContain("password");
+
+    const res = await api(auth).redeemInvite({
+      body: { token: orgInvite.token, password: PASSWORD, name: "Invitee" }
+    });
+    expect(res.action).toBe("ACCEPTED");
+    expect(res.organization?.id).toBe(org.id);
+    const user = await findUserByEmail(auth, "stuck@app.com");
+    expect(user?.emailVerified).toBe(true);
+    // The org-join grant is what got written, never the app invite's role.
+    expect((user as { role?: string })?.role).toBe("user");
+    expect(await getMemberRow(auth, user!.id, org.id)).toBeTruthy();
+
+    // Handover: the stale app invite no longer owns the shell.
+    expect((await findInviteRow(auth, appInvite.inviteId))?.preCreatedUserId).toBeNull();
+
+    // If the admin later resends it, it is an activation over a real
+    // account: sign in, confirm, roles merge.
+    const before = sentInvites(auth).length;
+    await api(auth).resendInvite({ body: { inviteId: appInvite.inviteId }, headers: adminHeaders });
+    const resentToken = sentInvites(auth)[before]!.token;
+    expect((await api(auth).getInvite({ query: { token: resentToken } })).nextAction).toBe(
+      "SIGN_IN"
+    );
+    const headers = await signInHeaders(auth, "stuck@app.com", PASSWORD);
+    const merged = await api(auth).redeemInvite({ body: { token: resentToken }, headers });
+    expect(merged.action).toBe("ACCEPTED");
+    expect(merged.role.split(",").sort()).toEqual(["partner", "user"]);
+  });
+
+  it("vice versa: expired org-join, then an app invite by the admin, claims the shell and hands over", async () => {
+    const { auth, adminHeaders, ownerHeaders, org } = await setupOrg();
+    const orgInvite = await createInvite(auth, {
+      body: { kind: "org-join", email: "flip@app.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    await expireInvite(auth, orgInvite.inviteId);
+
+    // Another scope's expired row is not a lock for the admin.
+    const appInvite = await createInvite(auth, {
+      body: { kind: "app", email: "flip@app.com", role: "partner" },
+      headers: adminHeaders
+    });
+    expect((await api(auth).getInvite({ query: { token: appInvite.token } })).nextAction).toBe(
+      "SIGN_UP"
+    );
+    const res = await api(auth).redeemInvite({
+      body: { token: appInvite.token, password: PASSWORD, name: "Invitee" }
+    });
+    expect(res.action).toBe("ACCEPTED");
+    const user = await findUserByEmail(auth, "flip@app.com");
+    expect((user as { role?: string })?.role).toBe("partner");
+    expect((await findInviteRow(auth, orgInvite.inviteId))?.preCreatedUserId).toBeNull();
+
+    // The org owner resends theirs: activation, joins the org, keeps partner.
+    const before = sentInvites(auth).length;
+    await api(auth).resendInvite({ body: { inviteId: orgInvite.inviteId }, headers: ownerHeaders });
+    const resentToken = sentInvites(auth)[before]!.token;
+    const headers = await signInHeaders(auth, "flip@app.com", PASSWORD);
+    expect((await api(auth).getInvite({ query: { token: resentToken }, headers })).nextAction).toBe(
+      "CONFIRM"
+    );
+    const joined = await api(auth).redeemInvite({ body: { token: resentToken }, headers });
+    expect(joined.action).toBe("ACCEPTED");
+    expect(joined.organization?.id).toBe(org.id);
+    expect(await getMemberRow(auth, user!.id, org.id)).toBeTruthy();
+    expect(joined.role.split(",")).toContain("partner");
+  });
+
+  it("two live invites in different scopes coexist and redeem in either order", async () => {
+    const { auth, adminHeaders, ownerHeaders, org } = await setupOrg();
+    const appInvite = await createInvite(auth, {
+      body: { kind: "app", email: "both@app.com", role: "partner" },
+      headers: adminHeaders
+    });
+    const orgInvite = await createInvite(auth, {
+      body: { kind: "org-join", email: "both@app.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    // Second one (no shell of its own) is redeemed first: still a sign-up.
+    expect((await api(auth).getInvite({ query: { token: orgInvite.token } })).nextAction).toBe(
+      "SIGN_UP"
+    );
+    const first = await api(auth).redeemInvite({
+      body: { token: orgInvite.token, password: PASSWORD, name: "Invitee" }
+    });
+    expect(first.organization?.id).toBe(org.id);
+    // The app invite, which pre-created the shell, is now an activation.
+    expect((await api(auth).getInvite({ query: { token: appInvite.token } })).nextAction).toBe(
+      "SIGN_IN"
+    );
+    const headers = await signInHeaders(auth, "both@app.com", PASSWORD);
+    const second = await api(auth).redeemInvite({ body: { token: appInvite.token }, headers });
+    expect(second.action).toBe("ACCEPTED");
+    expect(second.role.split(",").sort()).toEqual(["partner", "user"]);
+  });
+
+  it("same-scope duplicates still conflict: resend is the path, and list resolves the row", async () => {
+    const { auth, adminHeaders, ownerHeaders, org } = await setupOrg();
+    const appInvite = await createInvite(auth, {
+      body: { kind: "app", email: "dup@app.com" },
+      headers: adminHeaders
+    });
+    expect(
+      await errCode(
+        createInvite(auth, { body: { kind: "app", email: "dup@app.com" }, headers: adminHeaders })
+      )
+    ).toBe("EMAIL_ALREADY_INVITED");
+    const orgInvite = await createInvite(auth, {
+      body: { kind: "org-join", email: "dup@app.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    expect(
+      await errCode(
+        createInvite(auth, {
+          body: { kind: "org-join", email: "dup@app.com", organizationId: org.id },
+          headers: ownerHeaders
+        })
+      )
+    ).toBe("EMAIL_ALREADY_INVITED");
+
+    // email + kind filters on list point a UI at the exact row to resend.
+    const forAdmin = await api(auth).listInvites({
+      query: { email: "DUP@app.com", kind: "app" },
+      headers: adminHeaders
+    });
+    expect(forAdmin.invites.map((i: { id: string }) => i.id)).toEqual([appInvite.inviteId]);
+    const forOwner = await api(auth).listInvites({
+      query: { email: "dup@app.com", kind: "org-join", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    expect(forOwner.invites.map((i: { id: string }) => i.id)).toEqual([orgInvite.inviteId]);
+  });
+
+  it("deleting the invite that owned the shell does not strand a coexisting invite", async () => {
+    const { auth, adminHeaders, ownerHeaders, org } = await setupOrg();
+    const appInvite = await createInvite(auth, {
+      body: { kind: "app", email: "gone@app.com" },
+      headers: adminHeaders
+    });
+    const orgInvite = await createInvite(auth, {
+      body: { kind: "org-join", email: "gone@app.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    await api(auth).deleteInvite({ body: { inviteId: appInvite.inviteId }, headers: adminHeaders });
+    expect(await findUserByEmail(auth, "gone@app.com")).toBeFalsy();
+
+    // No account at all: the token still proves the mailbox, so redeem
+    // creates one instead of failing with PRE_CREATED_USER_MISSING.
+    expect((await api(auth).getInvite({ query: { token: orgInvite.token } })).nextAction).toBe(
+      "SIGN_UP"
+    );
+    const res = await api(auth).redeemInvite({
+      body: { token: orgInvite.token, password: PASSWORD, name: "Invitee" }
+    });
+    expect(res.action).toBe("ACCEPTED");
+    const user = await findUserByEmail(auth, "gone@app.com");
+    expect(user?.emailVerified).toBe(true);
+    expect(await getMemberRow(auth, user!.id, org.id)).toBeTruthy();
+  });
+
   it("signed-in user redeeming a public org invite activates instead of conflicting", async () => {
     const { auth, ownerHeaders, org } = await setupOrg();
     const existing = await seedUser(auth, {
