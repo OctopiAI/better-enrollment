@@ -304,6 +304,34 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     return invites.some((i) => i.status !== "accepted" && i.preCreatedUserId);
   }
 
+  // An account is established once somebody can sign into it: verified, or
+  // holding any account row (magic-link users are verified with zero rows).
+  // Anything else is an inert pre-created shell.
+  async function isEstablished(
+    ctx: GenericEndpointContext,
+    user: { id: string; emailVerified: boolean }
+  ): Promise<boolean> {
+    if (user.emailVerified) return true;
+    const accounts = await ctx.context.internalAdapter.findAccounts(user.id);
+    return accounts.length > 0;
+  }
+
+  // A private invite-only invite redeems as an activation (sign in, then
+  // confirm) only against an established account. Its own shell, another
+  // invite's inert shell, or no user at all are all sign-up: whichever live
+  // token for the email is redeemed first claims the shell, so redemption
+  // order across coexisting invites never matters.
+  async function privateInviteActivates(
+    ctx: GenericEndpointContext,
+    invite: Invite
+  ): Promise<boolean> {
+    if (invite.preCreatedUserId || !invite.email) return false;
+    const user = unwrapUser(
+      (await ctx.context.internalAdapter.findUserByEmail(invite.email)) as MaybeWithAccounts | null
+    );
+    return !!user && (await isEstablished(ctx, user));
+  }
+
   function buildInviteUrl(ctx: GenericEndpointContext, token: string, type: InviteType): string {
     if (opts.buildInviteUrl) {
       return opts.buildInviteUrl({ token, type, mode: getMode() });
@@ -511,6 +539,38 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     await ctx.context.adapter.delete({
       model: "invite",
       where: [{ field: "id", value: invite.id }]
+    });
+  }
+
+  // Batched sibling of deleteInviteAndInertUser: deletes user rows in
+  // `userIds` while still inert (unverified, zero accounts). Used wherever
+  // invite rows are bulk-deleted (cleanup, org deletion), so a pre-created
+  // shell never survives its owning invite with nothing left to delete it
+  // through, which would lock the email forever.
+  async function deleteInertShells(ctx: GenericEndpointContext, userIds: string[]): Promise<void> {
+    if (userIds.length === 0) return;
+    const users = await ctx.context.adapter.findMany<{ id: string; emailVerified: boolean }>({
+      model: "user",
+      where: [{ field: "id", value: userIds, operator: "in" }],
+      limit: userIds.length
+    });
+    const unverified = users.filter((u) => !u.emailVerified).map((u) => u.id);
+    if (unverified.length === 0) return;
+    const accounts = await ctx.context.adapter.findMany<{ userId: string }>({
+      model: "account",
+      where: [{ field: "userId", value: unverified, operator: "in" }],
+      limit: 100000
+    });
+    const linked = new Set(accounts.map((a) => a.userId));
+    const inert = unverified.filter((id) => !linked.has(id));
+    if (inert.length === 0) return;
+    await ctx.context.adapter.deleteMany({
+      model: "session",
+      where: [{ field: "userId", value: inert, operator: "in" }]
+    });
+    await ctx.context.adapter.deleteMany({
+      model: "user",
+      where: [{ field: "id", value: inert, operator: "in" }]
     });
   }
 
@@ -926,38 +986,53 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     const pre = await assertOrgRedeemable(ctx, invite, body);
 
     if (invite.type === "private") {
-      const target = invite.preCreatedUserId
+      let target = invite.preCreatedUserId
         ? await ctx.context.internalAdapter.findUserById(invite.preCreatedUserId)
         : unwrapUser(
             (await ctx.context.internalAdapter.findUserByEmail(
               invite.email!
             )) as MaybeWithAccounts | null
           );
+      // No account at all: the shell this invite relied on went with the
+      // invite that pre-created it (deleted, expired cleanup, org deletion),
+      // or was removed out of band. The token still proves the mailbox, so
+      // the accepter gets a fresh account instead of a dead end.
+      let createdShell = false;
       if (!target) {
-        throw APIError.from("NOT_FOUND", INVITE_ERROR_CODES.PRE_CREATED_USER_MISSING);
+        try {
+          target = await ctx.context.internalAdapter.createUser({
+            email: invite.email!,
+            name: "",
+            emailVerified: false,
+            role: invite.role
+          });
+          createdShell = true;
+        } catch {
+          throw APIError.from("NOT_FOUND", INVITE_ERROR_CODES.PRE_CREATED_USER_MISSING);
+        }
       }
       if (isBanned(target)) {
         throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.USER_BANNED);
       }
-      // An invite issued to an already-established account is an activation
-      // invite: merging into it requires the owner's session, not the token.
-      // Without this, accept would overwrite the account's credential. Only
-      // the invite's own pre-created shell is claimable through accept, so
-      // a retry whose earlier attempt already wrote the credential still
-      // passes, while accounts somebody owns are routed to sign-in.
-      // emailVerified counts as established too: magic-link users own zero
-      // account rows, so account count alone would misread them as shells.
-      if (!invite.preCreatedUserId) {
-        const targetAccounts = await ctx.context.internalAdapter.findAccounts(target.id);
-        if (targetAccounts.length > 0 || target.emailVerified) {
-          return ctx.json({
-            action: "SIGN_IN_REQUIRED" as const,
-            callbackURL: buildInviteUrl(ctx, body.token, invite.type)
-          });
-        }
+      // An invite issued to an established account is an activation invite:
+      // merging into it requires the owner's session, not the token.
+      // Without this, accept would overwrite the account's credential. The
+      // invite's own pre-created shell is always claimable, so a retry
+      // whose earlier attempt already wrote the credential still passes.
+      // Another invite's shell is claimable only while still inert.
+      if (!invite.preCreatedUserId && (await isEstablished(ctx, target))) {
+        return ctx.json({
+          action: "SIGN_IN_REQUIRED" as const,
+          callbackURL: buildInviteUrl(ctx, body.token, invite.type)
+        });
       }
       const claimed = await claimUse(ctx, invite);
       if (!claimed) {
+        if (createdShell) {
+          await ctx.context.adapter
+            .delete({ model: "user", where: [{ field: "id", value: target.id }] })
+            .catch(() => {});
+        }
         throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_ALREADY_USED);
       }
       let sessionCreated = false;
@@ -997,6 +1072,17 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
             name,
             ...extraFields
           })) ?? target;
+        // Handover: the account is real now. Other invites that pre-created
+        // this shell stop owning it, so they redeem as activations (roles
+        // merge, never overwrite) and the shell guards (magic link, cleanup)
+        // no longer read an established account as inert.
+        if (invite.preCreatedUserId !== target.id) {
+          await ctx.context.adapter.updateMany({
+            model: "invite",
+            where: [{ field: "preCreatedUserId", value: target.id }],
+            update: { preCreatedUserId: null, updatedAt: new Date() }
+          });
+        }
         const org = await applyOrgEffects(ctx, claimed, updated, pre);
         await recordUse(ctx, invite, target.id, target.email);
         // With a password, no session is created or mutated: the accepter
@@ -1378,16 +1464,19 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
     let emailHasUser = false;
     if (email) {
-      // Pending rows lock the email even past expiresAt.
-      // The admin must delete stale invites first.
-      // org-join checks within its own org only: the same email may
-      // be invited to several orgs, and an org inviter must not be
-      // able to probe for pending invites elsewhere in the app.
+      // The email lock is per scope: one pending row per (kind, org), held
+      // even past expiresAt, where resend is the release valve. Invites in
+      // other scopes always coexist (one email invited to several orgs, or
+      // to the app and an org): redemption is state-driven, so whichever
+      // live token is redeemed first claims the shell and the rest become
+      // activations. Scoping also keeps an org inviter from probing for
+      // pending invites elsewhere in the app.
       const existing = await ctx.context.adapter.findOne<Invite>({
         model: "invite",
         where: [
           { field: "email", value: email },
           { field: "status", value: "pending" },
+          { field: "kind", value: kind },
           ...(kind === "org-join" ? [{ field: "organizationId", value: org!.id }] : [])
         ]
       });
@@ -1398,11 +1487,13 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         (await ctx.context.internalAdapter.findUserByEmail(email)) as MaybeWithAccounts | null
       );
       if (existingUser && mode === "invite-only") {
-        // An org-bound invite to an existing account is an
-        // activation invite: no pre-created user, redeem merges
-        // the membership onto the signed-in user. App-kind
-        // invites grant nothing an existing user lacks.
-        if (kind === "app") {
+        // An org-bound invite to an established account is an activation
+        // invite: redeem merges the membership onto the signed-in user.
+        // App-kind invites grant nothing an established user lacks. An
+        // inert shell pre-created by another invite is neither: this
+        // invite skips pre-creation (the email is taken) and its token
+        // claims the shell at redemption like any other sign-up.
+        if (kind === "app" && (await isEstablished(ctx, existingUser))) {
           throw APIError.from("CONFLICT", INVITE_ERROR_CODES.USER_ALREADY_EXISTS);
         }
         emailHasUser = true;
@@ -2124,12 +2215,13 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           if (getMode() !== "invite-only") {
             return await activateCore(ctx, ctx.body);
           }
-          // Invites held by existing accounts redeem as activations: a
-          // private invite without a pre-created user was issued to an
-          // existing account, and a signed-in user redeeming a public
-          // invite already has one.
+          // Invites held by established accounts redeem as activations: a
+          // private invite whose email already belongs to an account that
+          // can be signed into, or a signed-in user redeeming a public
+          // invite. Everything else, including another invite's inert
+          // shell, is a sign-up.
           const invite = await findInviteByToken(ctx, ctx.body.token);
-          if (invite?.type === "private" && !invite.preCreatedUserId) {
+          if (invite?.type === "private" && (await privateInviteActivates(ctx, invite))) {
             return await activateCore(ctx, ctx.body);
           }
           if (invite?.type === "public") {
@@ -2169,9 +2261,9 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           let nextAction: "SIGN_UP" | "SIGN_IN" | "CONFIRM" | null = null;
           if (status === "pending") {
             if (getMode() === "invite-only") {
-              // Activation invites (existing accounts) sign in, not up.
+              // Activation invites (established accounts) sign in, not up.
               const activation =
-                (invite.type === "private" && !invite.preCreatedUserId) ||
+                (invite.type === "private" && (await privateInviteActivates(ctx, invite))) ||
                 (invite.type === "public" && !!session);
               nextAction = activation ? (session ? "CONFIRM" : "SIGN_IN") : "SIGN_UP";
             } else {
@@ -2277,6 +2369,8 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           query: z.object({
             status: z.enum(["pending", "accepted", "cancelled", "expired"]).optional(),
             type: z.enum(["private", "public"]).optional(),
+            kind: z.enum(["app", "org-join", "org-create"]).optional(),
+            email: z.string().max(200).optional(),
             organizationId: z.string().optional(),
             page: z.coerce.number().int().positive().default(1),
             limit: z.coerce.number().int().positive().max(100).default(20)
@@ -2286,8 +2380,14 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           const user = await getAuthUser(ctx);
           const admin = await isInviteAdmin(user, "list");
           const now = new Date();
+          // email + kind let a UI resolve EMAIL_ALREADY_INVITED to the exact
+          // row to resend. Same visibility rules as every other filter.
           const where = [
             ...(ctx.query.type ? [{ field: "type", value: ctx.query.type }] : []),
+            ...(ctx.query.kind ? [{ field: "kind", value: ctx.query.kind }] : []),
+            ...(ctx.query.email
+              ? [{ field: "email", value: ctx.query.email.toLowerCase().trim() }]
+              : []),
             ...(ctx.query.status === "expired"
               ? [
                   { field: "status", value: "pending" },
@@ -2633,6 +2733,13 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
               model: "invite",
               where: [{ field: "id", value: inviteIds, operator: "in" }]
             });
+            // Deleting the invite row must not leave its pre-created shell
+            // behind: with no invite left to own it, the email would be
+            // locked forever with nothing left to delete it through.
+            await deleteInertShells(
+              ctx,
+              invites.map((i) => i.preCreatedUserId).filter((v): v is string => !!v)
+            );
           }
           // The org plugin's own invitation table, when present.
           await ctx.context.adapter
@@ -2689,37 +2796,10 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
             // Pre-created users go too, but only while inert: unverified
             // and holding no accounts.
-            const shellIds = expired.map((i) => i.preCreatedUserId).filter((v): v is string => !!v);
-            if (shellIds.length > 0) {
-              const users = await ctx.context.adapter.findMany<{
-                id: string;
-                emailVerified: boolean;
-              }>({
-                model: "user",
-                where: [{ field: "id", value: shellIds, operator: "in" }],
-                limit: shellIds.length
-              });
-              const unverified = users.filter((u) => !u.emailVerified).map((u) => u.id);
-              if (unverified.length > 0) {
-                const accounts = await ctx.context.adapter.findMany<{ userId: string }>({
-                  model: "account",
-                  where: [{ field: "userId", value: unverified, operator: "in" }],
-                  limit: 100000
-                });
-                const linked = new Set(accounts.map((a) => a.userId));
-                const inert = unverified.filter((id) => !linked.has(id));
-                if (inert.length > 0) {
-                  await ctx.context.adapter.deleteMany({
-                    model: "session",
-                    where: [{ field: "userId", value: inert, operator: "in" }]
-                  });
-                  await ctx.context.adapter.deleteMany({
-                    model: "user",
-                    where: [{ field: "id", value: inert, operator: "in" }]
-                  });
-                }
-              }
-            }
+            await deleteInertShells(
+              ctx,
+              expired.map((i) => i.preCreatedUserId).filter((v): v is string => !!v)
+            );
 
             const ids = expired.map((i) => i.id);
             await ctx.context.adapter.deleteMany({
