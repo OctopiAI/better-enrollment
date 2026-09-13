@@ -19,6 +19,8 @@
   <a href="https://better-enrollment.octopi.ai">Documentation</a>
   ·
   <a href="https://github.com/OctopiAI/better-enrollment/issues">Issues</a>
+  ·
+  Built by <a href="https://www.talatmahmud.dev">Talat Mahmud</a>
 </p>
 
 <p align="center">
@@ -327,6 +329,10 @@ The full block table, the email-lock semantics, and token storage: [Security](ht
 - [Releases](https://github.com/OctopiAI/better-enrollment/releases): the changelog, with migration notes per version.
 
 Have an idea or found a problem? [Open an issue](https://github.com/OctopiAI/better-enrollment/issues).
+
+## Author
+
+Built and maintained by [Talat Mahmud](https://www.talatmahmud.dev), software engineer at [Octopi AI](https://www.octopi.ai).
 
 ## License
 

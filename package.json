@@ -4,6 +4,11 @@
   "description": "Invite-only signups, role-merging invite links, and organization invites for Better Auth. Private and public invites, org seat limits, full audit trail.",
   "type": "module",
   "license": "MIT",
+  "author": {
+    "name": "Talat Mahmud",
+    "email": "talat@octopi.ai",
+    "url": "https://www.talatmahmud.dev"
+  },
   "homepage": "https://github.com/OctopiAI/better-enrollment",
   "repository": {
     "type": "git",
