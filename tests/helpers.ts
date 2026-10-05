@@ -8,6 +8,8 @@ import { sha256Base64Url } from "../src/utils";
 export const ADMIN_EMAIL = "admin@test.com";
 export const ADMIN_PASSWORD = "admin-password-123";
 
+const SEED_SOURCE = { method: "admin" } as const;
+
 type SentInvite = { email: string | null; url: string; token: string };
 
 /** Every invite link the plugin handed to a send function, per auth instance. */
@@ -34,7 +36,7 @@ export async function createTestAuth(config?: {
     sent.push({ email: null, url: data.url, token: data.token });
     await callerPublic?.(data, request);
   };
-  const auth = betterAuth({
+  const options = {
     baseURL: "http://localhost:3000",
     secret: "test-secret-key-for-vitest-only-1234567890",
     database: new Database(":memory:"),
@@ -49,9 +51,11 @@ export async function createTestAuth(config?: {
       })
     ],
     ...(config?.auth ?? {})
-  });
-  const { runMigrations } = await getMigrations(auth.options);
+  } satisfies BetterAuthOptions;
+  // Migrate first: since 1.7 the instance validates the schema at startup.
+  const { runMigrations } = await getMigrations(options);
   await runMigrations();
+  const auth = betterAuth(options);
   // Force plugin init to run now so misconfiguration throws here, not lazily.
   await auth.$context;
   sentByAuth.set(auth, sent);
@@ -76,12 +80,15 @@ export async function seedUser(
   }
 ) {
   const ctx = await auth.$context;
-  const created = await ctx.internalAdapter.createUser({
-    email: user.email,
-    name: user.name ?? "Test User",
-    emailVerified: user.emailVerified ?? true,
-    role: user.role ?? "user"
-  });
+  const created = await ctx.internalAdapter.createUser(
+    {
+      email: user.email,
+      name: user.name ?? "Test User",
+      emailVerified: user.emailVerified ?? true,
+      role: user.role ?? "user"
+    },
+    SEED_SOURCE
+  );
   if (user.password) {
     const hash = await ctx.password.hash(user.password);
     await ctx.internalAdapter.createAccount({
@@ -190,12 +197,15 @@ export async function insertInviteRow(
   }
 ) {
   const ctx = await auth.$context;
-  const inviter = await ctx.internalAdapter.createUser({
-    email: `seed-${fields.token}@seed.com`,
-    name: "Seed",
-    emailVerified: true,
-    role: "admin"
-  });
+  const inviter = await ctx.internalAdapter.createUser(
+    {
+      email: `seed-${fields.token}@seed.com`,
+      name: "Seed",
+      emailVerified: true,
+      role: "admin"
+    },
+    SEED_SOURCE
+  );
   let preCreatedUserId = fields.preCreatedUserId ?? null;
   if (
     !preCreatedUserId &&
@@ -203,12 +213,15 @@ export async function insertInviteRow(
     fields.email &&
     (fields.mode ?? "invite-only") === "invite-only"
   ) {
-    const invitee = await ctx.internalAdapter.createUser({
-      email: fields.email,
-      name: "",
-      emailVerified: false,
-      role: fields.role
-    });
+    const invitee = await ctx.internalAdapter.createUser(
+      {
+        email: fields.email,
+        name: "",
+        emailVerified: false,
+        role: fields.role
+      },
+      SEED_SOURCE
+    );
     preCreatedUserId = invitee.id;
   }
   const now = new Date();

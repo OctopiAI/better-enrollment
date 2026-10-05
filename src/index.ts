@@ -50,6 +50,9 @@ export { roleGate } from "./utils";
 
 const DEFAULT_EXPIRES_IN = 60 * 60 * 24 * 7;
 
+/** Passed to `user.validateUserInfo` (Better Auth >= 1.7) for every user this plugin creates. */
+const PROVISIONING_SOURCE = { method: "invite" } as const;
+
 type SignupPath = {
   name: string;
   open: boolean;
@@ -1000,14 +1003,19 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       let createdShell = false;
       if (!target) {
         try {
-          target = await ctx.context.internalAdapter.createUser({
-            email: invite.email!,
-            name: "",
-            emailVerified: false,
-            role: invite.role
-          });
+          target = await ctx.context.internalAdapter.createUser(
+            {
+              email: invite.email!,
+              name: "",
+              emailVerified: false,
+              role: invite.role
+            },
+            PROVISIONING_SOURCE
+          );
           createdShell = true;
-        } catch {
+        } catch (e) {
+          // validateUserInfo and database hook rejections keep their own error.
+          if (e instanceof APIError) throw e;
           throw APIError.from("NOT_FOUND", INVITE_ERROR_CODES.PRE_CREATED_USER_MISSING);
         }
       }
@@ -1153,13 +1161,16 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     }
     let createdUserId: string | null = null;
     try {
-      const user = await ctx.context.internalAdapter.createUser({
-        email,
-        name,
-        emailVerified: opts.autoVerifyPublicInviteEmail,
-        role,
-        ...extraFields
-      });
+      const user = await ctx.context.internalAdapter.createUser(
+        {
+          email,
+          name,
+          emailVerified: opts.autoVerifyPublicInviteEmail,
+          role,
+          ...extraFields
+        },
+        PROVISIONING_SOURCE
+      );
       createdUserId = user.id;
       if (body.password) {
         const hash = await ctx.context.password.hash(body.password);
@@ -1506,14 +1517,18 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     let preCreatedUserId: string | null = null;
     if (mode === "invite-only" && type === "private" && email && !emailHasUser) {
       try {
-        const created = await ctx.context.internalAdapter.createUser({
-          email,
-          name: body.name ?? "",
-          emailVerified: false,
-          role
-        });
+        const created = await ctx.context.internalAdapter.createUser(
+          {
+            email,
+            name: body.name ?? "",
+            emailVerified: false,
+            role
+          },
+          PROVISIONING_SOURCE
+        );
         preCreatedUserId = created.id;
-      } catch {
+      } catch (e) {
+        if (e instanceof APIError) throw e;
         // Unique-email race: a concurrent create pre-created this
         // user between our conflict check and now.
         throw APIError.from("CONFLICT", INVITE_ERROR_CODES.EMAIL_ALREADY_INVITED);

@@ -100,7 +100,7 @@ Tokens are crypto-random and stored SHA-256 hashed, every state change is a guar
 npm install @octopi-ai/better-enrollment
 ```
 
-Requires `better-auth >= 1.4.0` and `zod >= 4`.
+Requires `better-auth >= 1.4.0` and `zod >= 4`. Tested against 1.6 and 1.7. On 1.7, users the plugin creates go through your `user.validateUserInfo` gate with `source.method === "invite"`, and a rejection reaches the caller as your own error code.
 
 Add the plugin to your `betterAuth` config (this example is a fully closed app) and your auth client, then migrate:
 
