@@ -1335,15 +1335,17 @@ describe("platform controls", () => {
       headers: adminHeaders
     });
 
+    // Thunks, awaited one at a time: eager promises that reject before their
+    // await is reached surface as unhandled rejections.
     const frozen = [
-      api(auth).listInvites({ query: { organizationId: org.id }, headers: ownerHeaders }),
-      api(auth).orgInviteUsage({ query: { organizationId: org.id }, headers: ownerHeaders }),
-      api(auth).resendInvite({ body: { inviteId: pending.inviteId }, headers: ownerHeaders }),
-      api(auth).revokeInvite({ body: { inviteId: pending.inviteId }, headers: ownerHeaders }),
-      api(auth).deleteInvite({ body: { inviteId: pending.inviteId }, headers: ownerHeaders })
+      () => api(auth).listInvites({ query: { organizationId: org.id }, headers: ownerHeaders }),
+      () => api(auth).orgInviteUsage({ query: { organizationId: org.id }, headers: ownerHeaders }),
+      () => api(auth).resendInvite({ body: { inviteId: pending.inviteId }, headers: ownerHeaders }),
+      () => api(auth).revokeInvite({ body: { inviteId: pending.inviteId }, headers: ownerHeaders }),
+      () => api(auth).deleteInvite({ body: { inviteId: pending.inviteId }, headers: ownerHeaders })
     ];
     for (const call of frozen) {
-      expect(await errCode(call)).toBe("ORG_DISABLED");
+      expect(await errCode(call())).toBe("ORG_DISABLED");
     }
 
     const listed = await api(auth).listInvites({
