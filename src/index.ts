@@ -573,6 +573,13 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     return user;
   }
 
+  /** org-create invites found organizations: `manage-orgs`, like the org controls. */
+  async function assertMayFoundOrgs(user: BannableUser): Promise<void> {
+    if (!(await isInviteAdmin(user, "manage-orgs"))) {
+      throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.NOT_ALLOWED_TO_MANAGE_INVITES);
+    }
+  }
+
   // ------------------------------------------------------- role ceiling
   // An invite that grants a role is a role assignment. Whoever chooses or
   // receives the link must hold the right to assign it, so invite rights
@@ -655,12 +662,32 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
   const defaultOrgRole = () => orgOpts?.defaultOrganizationRole ?? "member";
 
+  /**
+   * The org plugin's creatorRole ("owner" by default) controls the org. A
+   * role merely named "owner" under another creatorRole is ordinary.
+   */
+  const isTopOrgRole = (role: string) => role === state.orgCreatorRole;
+
+  /**
+   * The owner rule: the creatorRole is granted only with allowOwnerInvites,
+   * and only by a member who holds it, as the org plugin requires.
+   */
+  function mayGrantTopOrgRole(member: MemberRecord | null, role: string): boolean {
+    if (!splitRoles(role).some(isTopOrgRole)) return true;
+    return !!orgOpts?.allowOwnerInvites && !!member && splitRoles(member.role).some(isTopOrgRole);
+  }
+
+  /**
+   * Whether a member may grant an org role through an invite. Used at
+   * create, public resend, the role-change hook and the redemption re-check.
+   */
   async function canGrantOrgRole(
     ctx: GenericEndpointContext,
     member: MemberRecord,
     org: OrganizationRecord,
     role: string
   ): Promise<boolean> {
+    if (!mayGrantTopOrgRole(member, role)) return false;
     const wanted = splitRoles(role);
     const def = defaultOrgRole();
     if (wanted.every((r) => r === def)) return true;
@@ -686,7 +713,8 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
   /**
    * Redeeming your own invite assigns its roles to yourself. Allowed only
    * with full authority for each: user:set-role for the app role,
-   * member:update in the org for the org role. grantableRoles and the
+   * member:update in the org for the org role, manage-orgs for founding an
+   * org through org-create. grantableRoles and the
    * canGrant callbacks delegate granting to others, never to oneself.
    */
   async function assertNotSelfGrant(
@@ -700,11 +728,17 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     if (allowed && !splitRoles(invite.role).every((r) => r === opts.defaultRole)) {
       allowed = holdsSetRole(fresh!);
     }
+    if (allowed && invite.kind === "org-create") {
+      allowed = await isInviteAdmin(fresh!, "manage-orgs");
+    }
     if (allowed && invite.kind === "org-join" && invite.organizationId) {
       const orgRole = invite.organizationRole ?? defaultOrgRole();
       if (!splitRoles(orgRole).every((r) => r === defaultOrgRole())) {
         const member = await findMember(ctx, userId, invite.organizationId);
-        allowed = !!member && (await memberHasOrgPermission(ctx, member, "member", "update"));
+        allowed =
+          !!member &&
+          mayGrantTopOrgRole(member, orgRole) &&
+          (await memberHasOrgPermission(ctx, member, "member", "update"));
       }
     }
     if (!allowed) {
@@ -1091,7 +1125,11 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         (await canGrantOrgRole(ctx, member, org, invite.organizationRole ?? defaultOrgRole()))
       );
     }
-    return (await isInviteAdmin(creator, "create")) && (await canGrantAppRole(creator, invite.role));
+    return (
+      (await isInviteAdmin(creator, "create")) &&
+      (invite.kind !== "org-create" || (await isInviteAdmin(creator, "manage-orgs"))) &&
+      (await canGrantAppRole(creator, invite.role))
+    );
   }
 
   // ---------------------------------------------------------------- org
@@ -1489,7 +1527,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       );
       const member = await adapter.create<Record<string, unknown>, MemberRecord>({
         model: "member",
-        data: await memberDataFor(org, user, orgOpts?.orgCreateRole ?? "owner", now)
+        data: await memberDataFor(org, user, orgOpts?.orgCreateRole ?? state.orgCreatorRole, now)
       });
       undo.push(removeMember(member.id));
       await orgPluginHooks()?.afterAddMember?.({ member, user, organization: org });
@@ -2488,14 +2526,12 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       if (body.presetSeatLimit != null || body.organization) {
         throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.ORG_FIELDS_NOT_ALLOWED);
       }
-      let memberRoles: string[] = [];
       let creatorMember: MemberRecord | null = null;
       if (actor.type === "user") {
         creator = await getAuthUser(ctx);
         const access = await requireOrgInviteAccess(ctx, creator, body.organizationId, "create");
         org = access.org;
         creatorMember = access.member;
-        memberRoles = splitRoles(access.member.role);
       } else {
         org = await findOrg(ctx, body.organizationId);
         if (!org) {
@@ -2510,12 +2546,12 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       if (!known.includes(organizationRole)) {
         throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.INVALID_ORG_ROLE);
       }
-      if (organizationRole === "owner") {
+      if (splitRoles(organizationRole).some(isTopOrgRole)) {
         // A system actor has no membership; the option is its only gate.
         const mayInviteOwner =
           actor.type === "system"
             ? !!orgOpts?.allowOwnerInvites
-            : !!orgOpts?.allowOwnerInvites && memberRoles.includes("owner");
+            : mayGrantTopOrgRole(creatorMember, organizationRole);
         if (!mayInviteOwner) {
           throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.OWNER_INVITES_NOT_ALLOWED);
         }
@@ -2552,6 +2588,8 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     } else {
       if (actor.type === "user") {
         creator = await requireInviteAdmin(ctx, "create");
+        // Founding an org (and fixing its seat limit) is a platform action.
+        if (kind === "org-create") await assertMayFoundOrgs(creator);
         await assertCanGrantAppRole(creator, role);
       }
       if (body.organizationId || body.organizationRole || body.teamId) {
@@ -3197,7 +3235,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         },
         {
           // A disabled org rejects org plugin traffic targeting it,
-          // whether addressed by id, slug, invitationId, or implicitly
+          // whether addressed by id, slug, invitation, team, or implicitly
           // through the session's active organization. Every target the
           // request names is checked, in body and query alike: endpoints
           // differ in which one they prefer (reads take the slug over the
@@ -3226,7 +3264,12 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
               }
               if (bySlug) orgIds.add(bySlug.id);
             }
-            for (const invitationId of named("invitationId")) {
+            // get-invitation names its invitation as `id`.
+            const invitationIds = [
+              ...named("invitationId"),
+              ...(ctx.path === "/organization/get-invitation" ? named("id") : [])
+            ];
+            for (const invitationId of invitationIds) {
               const invitation = await ctx.context.adapter
                 .findOne<{ organizationId?: string }>({
                   model: "invitation",
@@ -3234,6 +3277,15 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
                 })
                 .catch(() => null);
               if (invitation?.organizationId) orgIds.add(invitation.organizationId);
+            }
+            for (const teamId of named("teamId")) {
+              const team = await ctx.context.adapter
+                .findOne<{ organizationId?: string }>({
+                  model: "team",
+                  where: [{ field: "id", value: teamId }]
+                })
+                .catch(() => null);
+              if (team?.organizationId) orgIds.add(team.organizationId);
             }
             if (orgIds.size > 0) {
               for (const id of orgIds) {
@@ -3268,6 +3320,36 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         }
       ],
       after: [
+        {
+          // The caller's own invitation list names no org, so the
+          // disabled-org before-hook cannot refuse it; drop invitations to
+          // disabled orgs from the answer instead. One read, this path only.
+          matcher: (ctx) => ctx.path === "/organization/list-user-invitations",
+          handler: createAuthMiddleware(async (ctx) => {
+            if (!orgEnabled()) return;
+            const returned = ctx.context.returned;
+            if (!Array.isArray(returned) || returned.length === 0) return;
+            const rows = returned as { organizationId?: unknown }[];
+            const ids = [
+              ...new Set(
+                rows
+                  .map((i) => i?.organizationId)
+                  .filter((v): v is string => typeof v === "string")
+              )
+            ];
+            if (ids.length === 0) return;
+            const orgs = await ctx.context.adapter.findMany<OrganizationRecord>({
+              model: "organization",
+              where: [{ field: "id", value: ids, operator: "in" }],
+              limit: ids.length
+            });
+            const disabled = new Set(orgs.filter((o) => o.disabledAt).map((o) => o.id));
+            if (disabled.size === 0) return;
+            return ctx.json(
+              rows.filter((i) => !disabled.has(i?.organizationId as string))
+            );
+          })
+        },
         {
           // Bans and account deletion are handled by the user database
           // hooks (any path). The org plugin writes member rows directly, so
@@ -3422,6 +3504,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           // to grant its roles. Private links go only to the mailbox.
           if (invite.type === "public") {
             assertPublicRolesAllowed(invite, "UNPROCESSABLE_ENTITY");
+            if (invite.kind === "org-create") await assertMayFoundOrgs(user);
             await assertCanGrantAppRole(user, invite.role);
             if (invite.kind === "org-join" && org) {
               const orgRole = invite.organizationRole ?? defaultOrgRole();
