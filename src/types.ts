@@ -209,7 +209,10 @@ export interface BetterEnrollmentOrgOptions {
     org: OrganizationRecord,
     role: string
   ) => Promise<boolean> | boolean;
-  /** Allow org-join invites that grant the "owner" org role. Default false. */
+  /**
+   * Allow org-join invites that grant the org plugin's creatorRole ("owner"
+   * unless configured), for members holding it. Default false.
+   */
   allowOwnerInvites?: boolean;
   /**
    * Org roles a public org-join invite may grant, like the top-level
@@ -241,7 +244,10 @@ export interface BetterEnrollmentOrgOptions {
   respectMembershipLimit?: boolean;
   /** Org role granted when an org-join invite does not name one. Default "member". */
   defaultOrganizationRole?: string;
-  /** Org role granted to the founder via an org-create invite. Default "owner". */
+  /**
+   * Org role granted to the founder via an org-create invite. Default: the
+   * org plugin's creatorRole ("owner" unless configured).
+   */
   orgCreateRole?: string;
   /** Seat limit applied when the organization row has none. */
   defaultSeatLimit?: number;
