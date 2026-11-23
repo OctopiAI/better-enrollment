@@ -45,7 +45,10 @@ const validateBeforeSend: BetterFetchPlugin = {
         statusText: "Unprocessable Entity",
         headers: { "content-type": "application/json" }
       });
-    return { url, options: { ...options, customFetchImpl: reply } };
+    // better-fetch < 1.3.2 hands each plugin the original per-call options, so set it there.
+    const opts = options ?? {};
+    opts.customFetchImpl = reply;
+    return { url, options: opts };
   }
 };
 
