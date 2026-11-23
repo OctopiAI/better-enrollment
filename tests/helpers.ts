@@ -47,6 +47,8 @@ export async function createTestAuth(config?: {
       betterEnrollment({
         mode: "invite-only",
         validRoles: ["user", "partner", "admin"],
+        // Tests resend right after creating; request-limits.test.ts covers it.
+        resendCooldown: 0,
         ...inviteOptions
       })
     ],

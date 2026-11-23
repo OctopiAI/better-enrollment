@@ -6,3 +6,6 @@ dist
 CLAUDE.md
 .claude
 .idea
+
+# Packed tarballs (pnpm pack)
+*.tgz

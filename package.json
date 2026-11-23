@@ -1,6 +1,6 @@
 {
   "name": "@octopi-ai/better-enrollment",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Invite-only signups, role-merging invite links, and organization invites for Better Auth. Private and public invites, org seat limits, full audit trail.",
   "type": "module",
   "license": "MIT",
@@ -52,7 +52,7 @@
     "prepublishOnly": "pnpm test && pnpm build"
   },
   "peerDependencies": {
-    "better-auth": ">=1.4.0",
+    "better-auth": ">=1.6.20",
     "zod": ">=4.0.0"
   },
   "devDependencies": {
@@ -60,7 +60,7 @@
     "better-auth": "1.7.7",
     "better-sqlite3": "^12.2.0",
     "prettier": "^3.9.6",
-    "tsdown": "latest",
+    "tsdown": "0.23.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0",
     "zod": "^4.6.5"
