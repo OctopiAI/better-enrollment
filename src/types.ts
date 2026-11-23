@@ -26,14 +26,19 @@ export interface Invite {
   presetOrganizationName: string | null;
   /** org-create: the founded org's slug, suffixed when taken at redemption. */
   presetOrganizationSlug: string | null;
+  /** Set only by invites created before 1.0, which pre-created the user. */
   preCreatedUserId: string | null;
   createdByUserId: string | null;
+  /** Created by createSystemInvite; null on invites created before 1.0. */
+  createdBySystem: boolean | null;
   inviterName: string;
   inviterEmail: string;
   expiresAt: Date | null;
   maxUses: number | null;
   useCount: number;
   revokedAt: Date | null;
+  /** When onInviteExpired fired for this invite; cleared by a resend. */
+  expiryNotifiedAt: Date | null;
   revokedByUserId: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -176,6 +181,25 @@ export interface PublicInvitationData {
   expiresAt: Date | null;
 }
 
+export interface ExistingAccountNoticeData {
+  /** The existing account's email, as entered on the invite page. */
+  email: string;
+  /** The existing account's display name. */
+  name: string;
+  role: string;
+  kind: InviteKind;
+  mode: InviteMode;
+  url: string;
+  inviterName: string;
+  inviterEmail: string;
+  organizationName: string | null;
+  inviteId: string;
+  organizationId: string | null;
+  organizationRole: string | null;
+  teamId: string | null;
+  expiresAt: Date | null;
+}
+
 export interface BetterEnrollmentOrgOptions {
   /** Kept for parity with the org plugin config; not read directly. */
   ac?: unknown;
@@ -217,9 +241,9 @@ export interface BetterEnrollmentOrgOptions {
   /**
    * Org roles a public org-join invite may grant, like the top-level
    * publicInviteRoles. Checked at create, resend and redemption. Default:
-   * any role.
+   * [defaultOrganizationRole]; null allows any role.
    */
-  publicInviteRoles?: string[];
+  publicInviteRoles?: string[] | null;
   /**
    * Apply the seat limit to the org plugin's own /organization/invite-member
    * and /organization/accept-invitation, which would otherwise add members
@@ -232,14 +256,13 @@ export interface BetterEnrollmentOrgOptions {
    * Run the org plugin's organizationHooks.beforeAddMember / afterAddMember
    * when a redemption adds a member, and honor a numeric
    * teams.maximumMembersPerTeam (a full team is skipped like a deleted
-   * one). Default false: these hooks were never called for invite
-   * redemptions, so turning them on may duplicate work you already do in
-   * onOrgMemberAdded.
+   * one). Default true. Set false if onOrgMemberAdded already does what
+   * those hooks do; 0.x never called them for redemptions.
    */
   runOrgPluginHooks?: boolean;
   /**
    * Also enforce the org plugin's membershipLimit at redemption, exactly as
-   * the org plugin does (its default is 100 members). Default false.
+   * the org plugin does (its default is 100 members). Default true.
    */
   respectMembershipLimit?: boolean;
   /** Org role granted when an org-join invite does not name one. Default "member". */
@@ -318,6 +341,22 @@ export interface BetterEnrollmentOptions {
   ) => Promise<void> | void;
   /** Called for public (shareable) invites, e.g. to notify or log. */
   sendPublicInvitation?: (data: PublicInvitationData, request?: Request) => Promise<void> | void;
+  /**
+   * Called when someone redeems a public link with the email of an existing
+   * account. The redeemer gets the same answer as for a new email, so mail
+   * that address the link with a note to sign in first. The token in `url`
+   * is the public link's own. Without it, nothing is sent.
+   */
+  sendExistingAccountNotice?: (
+    data: ExistingAccountNoticeData,
+    request?: Request
+  ) => Promise<void> | void;
+  /**
+   * Seconds before the same public invite mails the same existing account
+   * again (default one day; 0 = no limit). Kept in Better Auth's
+   * verification store, so it holds across server instances.
+   */
+  existingAccountNoticeCooldown?: number;
 
   /** Roles that may be granted through invites. Omit to skip validation. */
   validRoles?: string[];
@@ -356,17 +395,7 @@ export interface BetterEnrollmentOptions {
    * mailbox); public accepters sign in with their first magic link.
    */
   passwordless?: boolean | "auto";
-  /**
-   * @deprecated Ignored. Pre-created invite shells are now refused a
-   * session on every path, so no per-path list is needed.
-   */
-  passwordlessVerifyPaths?: string[];
 
-  /**
-   * Hash invite tokens at rest with SHA-256 (default true). Set false to
-   * store raw tokens (not recommended; a DB leak then exposes live links).
-   */
-  hashTokens?: boolean;
   /**
    * Invite-only mode, public invites: mark the signup's email verified
    * immediately. Default false so a leaked link cannot claim someone
@@ -427,16 +456,17 @@ export interface BetterEnrollmentOptions {
   /**
    * App roles a public invite may grant. A public link reaches whoever holds
    * it, so keep this to low roles. Checked at create, resend and redemption,
-   * so narrowing it also stops existing links. Default: any role.
+   * so narrowing it also stops existing links. Default: [defaultRole];
+   * null allows any role.
    */
-  publicInviteRoles?: string[];
+  publicInviteRoles?: string[] | null;
   /**
    * Startup check for `grantableRoles` and `organization.grantableRoles`:
    * each grantable role's access control permissions must be a subset of
    * its holder's, because a holder can always send a grantable role to a
-   * second account it controls. "warn" (default) logs every gap and every
-   * entry it cannot verify (roles without declared statements, dynamic org
-   * roles); "error" throws at startup; "off" skips the check.
+   * second account it controls. "error" (default) refuses to start on any
+   * gap or any entry it cannot verify (roles without declared statements,
+   * dynamic org roles); "warn" logs them instead; "off" skips the check.
    */
   grantableRolesCheck?: "warn" | "error" | "off";
   /** Overrides the app role ceiling. Receives the requested role string. */
@@ -465,16 +495,17 @@ export interface BetterEnrollmentOptions {
 
   /**
    * Build the URL embedded in invitation emails / returned from create.
-   * Default: `${origin(baseURL)}/invite?token=${token}`.
+   * Default: `${origin(baseURL)}/invite#token=${token}`. Required when
+   * Better Auth has no fixed baseURL (e.g. allowedHosts); init throws.
    */
   buildInviteUrl?: (data: { token: string; type: InviteType; mode: InviteMode }) => string;
   /**
-   * Where the default invite link carries its token. "query"
-   * (`/invite?token=`, default) or "fragment" (`/invite#token=`): a
-   * fragment never reaches servers, so it stays out of access logs, proxies
-   * and Referer headers. The page then reads `location.hash` and looks the
-   * invite up with POST, which takes the token in the body. Ignored when
-   * buildInviteUrl is set.
+   * Where the default invite link carries its token. "fragment"
+   * (`/invite#token=`, default) never reaches servers, so it stays out of
+   * access logs, proxies and Referer headers; the page reads
+   * `location.hash` and looks the invite up with POST, which takes the
+   * token in the body. "query" (`/invite?token=`) is the 0.x link. Ignored
+   * when buildInviteUrl is set.
    */
   linkStyle?: "query" | "fragment";
 
@@ -484,7 +515,10 @@ export interface BetterEnrollmentOptions {
   onInviteAccepted?: (data: { invite: Invite; user: User }) => Promise<void> | void;
   onInviteRevoked?: (data: { invite: Invite; admin: User }) => Promise<void> | void;
   onInviteDeleted?: (data: { invite: Invite; admin: User | null }) => Promise<void> | void;
-  /** Fires lazily when an expired invite is touched. May fire more than once. */
+  /**
+   * Fires lazily the first time an expired invite is touched, at most once
+   * per expiry (a resend that revives the invite starts a new one).
+   */
   onInviteExpired?: (data: { invite: Invite }) => Promise<void> | void;
   onInvalidRole?: (data: { invite: Invite; role: string }) => Promise<void> | void;
   /**
@@ -500,10 +534,9 @@ export interface BetterEnrollmentOptions {
    * Re-check at redemption (and in invite.get) that the invite's creator
    * still holds the rights it used: org membership with invitation:create
    * and the org role ceiling for org-join, the invite gate and app role
-   * ceiling otherwise. Default false. An invite whose creator was deleted
-   * or banned is always withdrawn, with or without this option. Leave it
-   * off when createSystemInvite attributes invites to users who are not
-   * members of the target org.
+   * ceiling otherwise. Default true; invites from createSystemInvite are
+   * exempt (createdBySystem). An invite whose creator was deleted or banned
+   * is always withdrawn, with or without this option.
    */
   revalidateInviterOnRedeem?: boolean;
 }
@@ -583,9 +616,9 @@ export const INVITE_ERROR_CODES = {
     "EMAIL_NOT_VERIFIED",
     "Verify your email address before activating this invitation"
   ),
-  PRE_CREATED_USER_MISSING: err(
-    "PRE_CREATED_USER_MISSING",
-    "The invited account could not be found"
+  REDEMPTION_IN_PROGRESS: err(
+    "REDEMPTION_IN_PROGRESS",
+    "Another invitation for this email is being redeemed. Try again."
   ),
   ACCEPTED_INVITES_ARE_PERMANENT: err(
     "ACCEPTED_INVITES_ARE_PERMANENT",
@@ -598,6 +631,10 @@ export const INVITE_ERROR_CODES = {
   INVITATION_REQUIRED: err(
     "INVITATION_REQUIRED",
     "An invitation link is required to activate your account"
+  ),
+  SIGN_UP_REQUIRES_INVITATION: err(
+    "SIGN_UP_REQUIRES_INVITATION",
+    "Accounts are created through an invitation link"
   ),
   PASSWORD_REQUIRED: err("PASSWORD_REQUIRED", "A password is required to accept this invitation"),
   PASSWORD_NOT_AVAILABLE: err(

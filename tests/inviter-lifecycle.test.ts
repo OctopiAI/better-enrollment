@@ -181,11 +181,11 @@ describe("invites follow their inviter (BE-LIB-04)", () => {
     expect(events.at(-1)?.reason).toBe("inviter-inactive");
   });
 
-  it("revalidateInviterOnRedeem also withdraws invites whose creator lost its rights", async () => {
+  it("redemption withdraws invites whose creator lost its rights, unless revalidateInviterOnRedeem is false", async () => {
     for (const strict of [false, true]) {
-      const { auth, org, lead, leadHeaders, friendHeaders } = await setup({
-        revalidateInviterOnRedeem: strict
-      });
+      const { auth, org, lead, leadHeaders, friendHeaders } = await setup(
+        strict ? {} : { revalidateInviterOnRedeem: false }
+      );
       const link = await orgLink(auth, org.id, leadHeaders);
       const ctx = await auth.$context;
       await ctx.adapter.update({
@@ -198,6 +198,27 @@ describe("invites follow their inviter (BE-LIB-04)", () => {
       );
       expect(res).toBe(strict ? "INVITE_REVOKED" : undefined);
     }
+  });
+
+  it("system invites attributed to a member do not depend on its org rights", async () => {
+    const { auth, events, ownerHeaders, org, lead, friendHeaders } = await setup();
+    const link = await api(auth).createSystemInvite({
+      body: {
+        kind: "org-join",
+        type: "public",
+        organizationId: org.id,
+        maxUses: 5,
+        inviter: { name: "Lead", email: "lead@acme.com", userId: lead.id }
+      }
+    });
+    expect((await findInviteRow(auth, link.inviteId))?.createdBySystem).toBe(true);
+    await api(auth).removeMember({
+      body: { memberIdOrEmail: "lead@acme.com", organizationId: org.id },
+      headers: ownerHeaders
+    });
+    expect(events).toEqual([]);
+    const res = await api(auth).redeemInvite({ body: { token: link.token }, headers: friendHeaders });
+    expect(res.action).toBe("ACCEPTED");
   });
 
   it("no false positives: unrelated updates and deletions leave invites alone, at no query cost", async () => {

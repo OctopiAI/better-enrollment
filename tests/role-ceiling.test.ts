@@ -197,17 +197,18 @@ describe("grantableRolesCheck (startup)", () => {
   });
 
   it("a role with permissions the holder lacks is reported", async () => {
-    const [warning] = await build({ support: ["strong"] });
+    const [warning] = await build({ support: ["strong"] }, "warn");
     expect(warning).toContain("support -> strong");
     expect(warning).toContain("user:list");
   });
 
   it("an undeclared role is reported as unverifiable", async () => {
-    const [warning] = await build({ support: ["ghost"] });
+    const [warning] = await build({ support: ["ghost"] }, "warn");
     expect(warning).toContain("cannot verify");
   });
 
-  it('"error" refuses to start; "off" stays silent', async () => {
+  it('"error" (the default) refuses to start; "off" stays silent', async () => {
+    await expect(build({ support: ["strong"] })).rejects.toThrow("support -> strong");
     await expect(build({ support: ["strong"] }, "error")).rejects.toThrow("support -> strong");
     expect(await build({ support: ["strong"] }, "off")).toEqual([]);
   });
@@ -228,7 +229,12 @@ describe("org role ceiling (BE-LIB-05)", () => {
   async function orgAuth(extra?: Record<string, unknown>) {
     const auth = await createTestAuth({
       plugins: [organization({ ac: orgAc, roles: orgRoles } as never)],
-      invite: { mode: "open", organization: { ac: orgAc, roles: orgRoles, ...extra } },
+      // Some cases grant past the holder on purpose; the startup check has its own tests.
+      invite: {
+        mode: "open",
+        grantableRolesCheck: "warn",
+        organization: { ac: orgAc, roles: orgRoles, ...extra }
+      },
       auth: { emailAndPassword: { enabled: true } }
     });
     const adminHeaders = await seedAdmin(auth);

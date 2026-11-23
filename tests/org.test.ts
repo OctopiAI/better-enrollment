@@ -4,6 +4,7 @@ import type { BetterEnrollmentOptions } from "../src";
 import type { PrivateInvitationEmailData, PublicInvitationData } from "../src/types";
 import { roleGate } from "../src";
 import {
+  addLegacyShell,
   createInvite,
   createTestAuth,
   expireInvite,
@@ -1057,7 +1058,14 @@ describe("org-create", () => {
         name: "Invitee"
       }
     });
-    expect(retry.organization?.slug).toBe("race-co-2");
+    expect(retry.action).toBe("CHECK_EMAIL");
+    const ctx = await auth.$context;
+    expect(
+      await ctx.adapter.findOne({
+        model: "organization",
+        where: [{ field: "slug", value: "race-co-2" }]
+      })
+    ).toBeTruthy();
   });
 });
 
@@ -1502,12 +1510,12 @@ describe("platform controls", () => {
     });
     expect((await findInviteRow(auth, pending.inviteId))?.status).toBe("cancelled");
 
-    // A pre-created user banned directly cannot accept their invite.
+    // A user pre-created by 0.x and banned directly cannot accept its invite.
     const other = await createInvite(auth, {
       body: { email: "banned-invitee@test.com" },
       headers: adminHeaders
     });
-    const invitee = await findUserByEmail(auth, "banned-invitee@test.com");
+    const invitee = await addLegacyShell(auth, other.inviteId);
     const ctx = await auth.$context;
     await ctx.adapter.update({
       model: "user",

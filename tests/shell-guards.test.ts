@@ -1,6 +1,7 @@
 import { emailOTP } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import {
+  addLegacyShell,
   cookieHeaders,
   createInvite,
   createTestAuth,
@@ -80,24 +81,65 @@ function mailbox() {
   };
 }
 
+/** An admin invite whose invitee has the unverified user 0.x pre-created. */
 async function adminInvite(auth: TestAuth) {
   const adminHeaders = await seedAdmin(auth);
   const inv = await createInvite(auth, {
     body: { type: "private", email: INVITEE, role: "admin" },
     headers: adminHeaders
   });
+  await addLegacyShell(auth, inv.inviteId);
   return { adminHeaders, inv };
 }
 
-describe("pre-created shell guards", () => {
-  it("the shell holds the default role; the invited role arrives at redemption", async () => {
+describe("no account before redemption", () => {
+  it("the account and the invited role arrive at redemption", async () => {
     const auth = await createTestAuth();
-    const { inv } = await adminInvite(auth);
-    expect(((await findUserByEmail(auth, INVITEE)) as { role?: string }).role).toBe("user");
+    const adminHeaders = await seedAdmin(auth);
+    const inv = await createInvite(auth, {
+      body: { type: "private", email: INVITEE, role: "admin" },
+      headers: adminHeaders
+    });
+    expect(await findUserByEmail(auth, INVITEE)).toBeNull();
     await auth.api.redeemInvite({ body: { token: inv.token, password: PASSWORD, name: "I" } });
     expect(((await findUserByEmail(auth, INVITEE)) as { role?: string }).role).toBe("admin");
   });
 
+  it("verification, email OTP and password reset find nothing to act on", async () => {
+    const box = mailbox();
+    const auth = await box.make({ otp: true });
+    const adminHeaders = await seedAdmin(auth);
+    const inv = await createInvite(auth, {
+      body: { type: "private", email: INVITEE, role: "admin" },
+      headers: adminHeaders
+    });
+
+    await http(auth, "POST", "/send-verification-email", { email: INVITEE });
+    expect(box.verifications.length).toBe(0);
+    await http(auth, "POST", "/email-otp/send-verification-otp", {
+      email: INVITEE,
+      type: "sign-in"
+    });
+    const signIn = await http(auth, "POST", "/sign-in/email-otp", {
+      email: INVITEE,
+      otp: box.otps.at(-1)?.otp ?? "000000"
+    });
+    expect(await sessionRole(auth, signIn.headers)).toBeNull();
+    await http(auth, "POST", "/request-password-reset", {
+      email: INVITEE,
+      redirectTo: "http://localhost:3000/reset"
+    });
+    expect(box.resets.length).toBe(0);
+    expect(await findUserByEmail(auth, INVITEE)).toBeNull();
+
+    const redeemed = await auth.api.redeemInvite({
+      body: { token: inv.token, password: PASSWORD, name: "I" }
+    });
+    expect(redeemed.action).toBe("ACCEPTED");
+  });
+});
+
+describe("users pre-created by 0.x stay guarded", () => {
   it("revoke removes the shell, so the verification mail has nothing to activate", async () => {
     const box = mailbox();
     const auth = await box.make({ autoSignIn: true });
@@ -139,6 +181,7 @@ describe("pre-created shell guards", () => {
       body: { type: "private", email: INVITEE, role: "admin" },
       headers: adminHeaders
     });
+    await addLegacyShell(auth, again.inviteId);
     await expireInvite(auth, again.inviteId);
     expect(await auth.api.cleanupExpiredInvites({ body: {} })).toEqual({ deleted: 1 });
     expect(await findUserByEmail(auth, INVITEE)).toBeFalsy();

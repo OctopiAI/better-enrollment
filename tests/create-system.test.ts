@@ -33,9 +33,9 @@ describe("system invite creation (server-only, no session)", () => {
     expect(row?.inviterName).toBe("System");
     expect(row?.inviterEmail).toBe("System");
 
-    // Invite-only invariants still apply: the user is pre-created inert.
-    const user = await findUserByEmail(auth, "invitee@test.com");
-    expect(row?.preCreatedUserId).toBe(user!.id);
+    // No account exists until the invite is redeemed.
+    expect(await findUserByEmail(auth, "invitee@test.com")).toBeNull();
+    expect(row?.preCreatedUserId).toBeNull();
 
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.inviterName).toBe("System");

@@ -131,12 +131,14 @@ describe("session storage (BE-LIB-03)", () => {
         body: { type: "private", email: "late@new.com" },
         headers: adminHeaders
       });
+      const ctx = await auth.$context;
+      const minted = vi.spyOn(ctx.internalAdapter, "createSession");
       await expect(
         api(auth).redeemInvite({ body: { token: inv.token, name: "Late" } })
       ).rejects.toThrow();
-      const ctx = await auth.$context;
-      const user = await findUserByEmail(auth, "late@new.com");
-      expect(await ctx.internalAdapter.listSessions(user!.id)).toEqual([]);
+      const userId = minted.mock.calls[0]![0] as string;
+      expect(await ctx.internalAdapter.listSessions(userId)).toEqual([]);
+      expect(await findUserByEmail(auth, "late@new.com")).toBeNull();
     });
   }
 

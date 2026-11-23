@@ -175,12 +175,12 @@ describe("seat limits (BE-LIB-06)", () => {
     expect(new Date(row?.expiresAt as string).getTime()).toBeLessThan(Date.now());
   });
 
-  describe("org plugin rules (opt-in)", () => {
-    it("runOrgPluginHooks: beforeAddMember can refuse, afterAddMember runs; off by default", async () => {
+  describe("org plugin rules (on by default)", () => {
+    it("runOrgPluginHooks: beforeAddMember can refuse, afterAddMember runs; false turns it off", async () => {
       for (const on of [false, true]) {
         const after = vi.fn();
         const { auth, ownerHeaders, org } = await setup({
-          invite: { runOrgPluginHooks: on },
+          invite: on ? {} : { runOrgPluginHooks: false },
           org: {
             organizationHooks: {
               beforeAddMember: async ({ user }: { user: { email: string } }) => {
@@ -210,10 +210,10 @@ describe("seat limits (BE-LIB-06)", () => {
       }
     });
 
-    it("respectMembershipLimit applies the org plugin's membershipLimit; off by default", async () => {
+    it("respectMembershipLimit applies the org plugin's membershipLimit; false turns it off", async () => {
       for (const on of [false, true]) {
         const { auth, ownerHeaders, org } = await setup({
-          invite: { respectMembershipLimit: on },
+          invite: on ? {} : { respectMembershipLimit: false },
           org: { membershipLimit: 2 }
         });
         const link = await api(auth).createInvite({

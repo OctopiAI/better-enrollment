@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  addLegacyShell,
   createInvite,
   createTestAuth,
   expireInvite,
@@ -9,6 +10,7 @@ import {
   insertInviteRow,
   seedAdmin,
   seedUser,
+  sentInvites,
   signInHeaders
 } from "./helpers";
 
@@ -23,23 +25,29 @@ async function captureError(fn: () => Promise<unknown>) {
 }
 
 describe("invite-only mode", () => {
-  it("creates a private invite: user pre-created unverified, no credential account", async () => {
+  it("creates a private invite without creating the user; redemption creates it", async () => {
     const auth = await createTestAuth();
     const headers = await seedAdmin(auth);
-    const res = await auth.api.createInvite({
-      body: { type: "private", email: "invitee@test.com", name: "Invitee", role: "user" },
+    const res = await createInvite(auth, {
+      body: { type: "private", email: "invitee@test.com", name: "Invitee", role: "partner" },
       headers
     });
     expect(res.inviteId).toBeTruthy();
-
-    const user = await findUserByEmail(auth, "invitee@test.com");
-    expect(user).toBeTruthy();
-    expect(user?.emailVerified).toBe(false);
-    const accounts = await findAccounts(auth, user!.id);
-    expect(accounts).toHaveLength(0);
-
+    expect(await findUserByEmail(auth, "invitee@test.com")).toBeNull();
     const row = await findInviteRow(auth, res.inviteId);
-    expect(row?.preCreatedUserId).toBe(user!.id);
+    expect(row?.preCreatedUserId).toBeNull();
+
+    await auth.api.redeemInvite({
+      body: { token: res.token, password: "invitee-password-1", name: "Invitee" }
+    });
+    const user = (await findUserByEmail(auth, "invitee@test.com")) as {
+      id: string;
+      emailVerified: boolean;
+      role?: string;
+    } | null;
+    expect(user?.emailVerified).toBe(true);
+    expect(user?.role).toBe("partner");
+    expect(await findAccounts(auth, user!.id)).toHaveLength(1);
   });
 
   it("runs on a custom rank system with no admin plugin: top ranks invite, lower ranks cannot", async () => {
@@ -242,17 +250,6 @@ describe("invite-only mode", () => {
     expect(res.user.email).toBe("hash@test.com");
   });
 
-  it("stores raw token when hashTokens:false", async () => {
-    const auth = await createTestAuth({ invite: { hashTokens: false } });
-    const headers = await seedAdmin(auth);
-    const { token, inviteId } = await createInvite(auth, {
-      body: { type: "private", email: "raw@test.com", role: "user" },
-      headers
-    });
-    const row = await findInviteRow(auth, inviteId);
-    expect(row?.tokenHash).toBe(token);
-  });
-
   it("rejects non-admin create with FORBIDDEN; honors canManageInvites override", async () => {
     const auth = await createTestAuth();
     await seedAdmin(auth);
@@ -335,7 +332,24 @@ describe("invite-only mode", () => {
     await expireInvite(auth, inviteId);
     const expired = await auth.api.getInvite({ query: { token } });
     expect(expired.status).toBe("expired");
-    expect(onInviteExpired).toHaveBeenCalled();
+    expect(onInviteExpired).toHaveBeenCalledTimes(1);
+
+    // Once per expiry: later and parallel reads and redeem attempts stay quiet.
+    await Promise.all([
+      auth.api.getInvite({ query: { token } }),
+      auth.api.getInvite({ query: { token } }),
+      captureError(() =>
+        auth.api.redeemInvite({ body: { token, password: "masked-pass-123", name: "M" } })
+      )
+    ]);
+    expect(onInviteExpired).toHaveBeenCalledTimes(1);
+
+    // A resend revives the invite; its next expiry fires again.
+    await auth.api.resendInvite({ body: { inviteId }, headers });
+    await expireInvite(auth, inviteId);
+    const fresh = sentInvites(auth).at(-1)!.token;
+    await auth.api.getInvite({ query: { token: fresh } });
+    expect(onInviteExpired).toHaveBeenCalledTimes(2);
   });
 
   it("get exposes the full email with exposeEmailOnGet", async () => {
@@ -567,12 +581,12 @@ describe("invite-only mode", () => {
     const u1 = await findUserByEmail(auth, "p1@test.com");
     expect(u1?.emailVerified).toBe(false);
 
-    // A taken email is not confirmed to the caller; they are sent to sign-in.
+    // A taken email gets the same answer as a new one.
     const dup = await auth.api.acceptInvite({
       body: { token, password: "password123", email: "p1@test.com", name: "Invitee" }
     });
-    if (!("action" in dup)) throw new Error("expected a sign-in redirect");
-    expect(dup.action).toBe("SIGN_IN_REQUIRED");
+    if (!("action" in dup)) throw new Error("expected an action");
+    expect(dup.action).toBe("CHECK_EMAIL");
 
     await auth.api.acceptInvite({
       body: { token, password: "password123", email: "p2@test.com", name: "Invitee" }
@@ -697,6 +711,8 @@ describe("invite-only mode", () => {
         body: { type: "private", email: `batch${i}@test.com`, role: "user" },
         headers
       });
+      // Some rows still carry a user pre-created by 0.x.
+      if (i % 2 === 0) await addLegacyShell(auth, inviteId);
       await expireInvite(auth, inviteId);
       expiredIds.push(inviteId);
     }
@@ -704,6 +720,7 @@ describe("invite-only mode", () => {
       body: { type: "private", email: "still-live@test.com", role: "user" },
       headers
     });
+    await addLegacyShell(auth, liveId);
 
     // batchSize 2 forces three loop passes over the five expired rows.
     const result = await auth.api.cleanupExpiredInvites({ body: { batchSize: 2 } });
@@ -787,8 +804,13 @@ describe("invite-only mode", () => {
     expect(auth).toBeTruthy();
   });
 
-  it("public accept with an existing email returns SIGN_IN_REQUIRED, never confirming the account", async () => {
-    const auth = await createTestAuth();
+  it("public accept answers an existing email like a new one and mails its owner the link", async () => {
+    const notices: { email: string; url: string }[] = [];
+    const auth = await createTestAuth({
+      invite: {
+        sendExistingAccountNotice: (d) => void notices.push({ email: d.email, url: d.url })
+      }
+    });
     const headers = await seedAdmin(auth);
     await seedUser(auth, { email: "resident@test.com", password: "resident-pass-123" });
     const created = await createInvite(auth, {
@@ -804,23 +826,76 @@ describe("invite-only mode", () => {
         name: "Invitee"
       }
     });
-    expect(res.action).toBe("SIGN_IN_REQUIRED");
-    expect(res.callbackURL).toContain(created.token);
+    expect(res).toEqual({ action: "CHECK_EMAIL" });
+    expect(notices).toEqual([{ email: "resident@test.com", url: created.url }]);
     // No use consumed, and the resident's password is untouched.
     const row = await findInviteRow(auth, created.inviteId);
     expect(row?.useCount).toBe(0);
     const stillSignsIn = await signInHeaders(auth, "resident@test.com", "resident-pass-123");
     expect(stillSignsIn.get("cookie")).toBeTruthy();
+
+    // A new address gets the identical answer, and the link's use counts
+    // are not shown to link holders.
+    const fresh = await auth.api.acceptInvite({
+      body: {
+        token: created.token,
+        password: "brand-new-pass-123",
+        email: "new@test.com",
+        name: "N"
+      }
+    });
+    expect(fresh).toEqual(res);
+    const info = await auth.api.getInvite({ query: { token: created.token } });
+    expect(info).not.toHaveProperty("useCount");
+    expect(info).not.toHaveProperty("usesRemaining");
   });
 
-  it("OAuth linking to a pre-created user is blocked while pending and after revocation", async () => {
+  it("a public link cannot register an address that holds a pending private invite", async () => {
+    const auth = await createTestAuth();
+    const headers = await seedAdmin(auth);
+    const pub = await createInvite(auth, { body: { type: "public", maxUses: 5 }, headers });
+    const priv = await createInvite(auth, {
+      body: { type: "private", email: "held@test.com" },
+      headers
+    });
+    const res = await auth.api.acceptInvite({
+      body: { token: pub.token, password: "squatter-pass-123", email: "held@test.com", name: "S" }
+    });
+    expect(res).toEqual({ action: "CHECK_EMAIL" });
+    expect(await findUserByEmail(auth, "held@test.com")).toBeNull();
+    expect((await findInviteRow(auth, pub.inviteId))?.useCount).toBe(0);
+
+    // The invitee still signs up through their own link.
+    const own = await auth.api.redeemInvite({
+      body: { token: priv.token, password: "owner-pass-12345", name: "Owner" }
+    });
+    expect(own.action).toBe("ACCEPTED");
+
+    // Two parallel sign-ups for one new address: one account, one use, one answer.
+    const both = await Promise.all(
+      [1, 2].map(() =>
+        auth.api.acceptInvite({
+          body: {
+            token: pub.token,
+            password: "racer-pass-12345",
+            email: "race@test.com",
+            name: "R"
+          }
+        })
+      )
+    );
+    expect(both).toEqual([{ action: "CHECK_EMAIL" }, { action: "CHECK_EMAIL" }]);
+    expect((await findInviteRow(auth, pub.inviteId))?.useCount).toBe(1);
+  });
+
+  it("OAuth linking to a 0.x pre-created user is blocked while pending and after revocation", async () => {
     const auth = await createTestAuth();
     const headers = await seedAdmin(auth);
     const created = await auth.api.createInvite({
       body: { type: "private", email: "linkme@test.com", role: "user" },
       headers
     });
-    const user = await findUserByEmail(auth, "linkme@test.com");
+    const user = await addLegacyShell(auth, created.inviteId);
     const ctx = await auth.$context;
     // The account.create.before hook fires inside better-auth's request
     // context (AsyncLocalStorage), which tests cannot enter; invoke the

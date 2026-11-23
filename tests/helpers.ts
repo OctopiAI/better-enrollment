@@ -49,7 +49,12 @@ export async function createTestAuth(config?: {
         validRoles: ["user", "partner", "admin"],
         // Tests resend right after creating; request-limits.test.ts covers it.
         resendCooldown: 0,
-        ...inviteOptions
+        // Tests issue public links for any role; hardening.test.ts covers the default.
+        publicInviteRoles: null,
+        ...inviteOptions,
+        ...(inviteOptions.organization
+          ? { organization: { publicInviteRoles: null, ...inviteOptions.organization } }
+          : {})
       })
     ],
     ...(config?.auth ?? {})
@@ -180,7 +185,10 @@ export async function findAccounts(auth: TestAuth, userId: string) {
   return await ctx.internalAdapter.findAccounts(userId);
 }
 
-/** Insert an invite row directly, bypassing create-time role validation. */
+/**
+ * Insert an invite row directly, bypassing create-time role validation. A
+ * private invite-only row gets a pre-created user the way 0.x wrote one.
+ */
 export async function insertInviteRow(
   auth: TestAuth,
   fields: {
@@ -244,6 +252,7 @@ export async function insertInviteRow(
       presetSeatLimit: null,
       preCreatedUserId,
       createdByUserId: inviter.id,
+      createdBySystem: false,
       inviterName: "Seed",
       inviterEmail: inviter.email,
       expiresAt: fields.expiresAt ?? new Date(Date.now() + 3600_000),
@@ -251,8 +260,30 @@ export async function insertInviteRow(
       useCount: 0,
       revokedAt: null,
       revokedByUserId: null,
+      expiryNotifiedAt: null,
       createdAt: now,
       updatedAt: now
     }
   });
+}
+
+/**
+ * Gives a pending private invite the pre-created user 0.x wrote at creation
+ * (unverified, default role, no account), so the guards that still protect
+ * those users stay covered. 1.0 never creates one.
+ */
+export async function addLegacyShell(auth: TestAuth, inviteId: string, role = "user") {
+  const ctx = await auth.$context;
+  const invite = await findInviteRow(auth, inviteId);
+  if (!invite?.email) throw new Error("legacy shells belong to private invites");
+  const shell = await ctx.internalAdapter.createUser(
+    { email: invite.email as string, name: "", emailVerified: false, role },
+    SEED_SOURCE
+  );
+  await ctx.adapter.update({
+    model: "invite",
+    where: [{ field: "id", value: inviteId }],
+    update: { preCreatedUserId: shell.id }
+  });
+  return shell;
 }

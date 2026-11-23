@@ -54,7 +54,7 @@
 - 💺 **Seat limits**: per-org caps with pending-invite reservations and subscription hooks.
 - 🛡️ **Security first**: hashed tokens, atomic race-safe redemption, no invite oracles.
 - 🧾 **Audit trail**: append-only record of who invited whom and who redeemed what.
-- 🧩 **One redemption page**: a single `?token=` page and one `redeem` call handle every invite kind in both modes.
+- 🧩 **One redemption page**: a single `#token=` page and one `redeem` call handle every invite kind in both modes.
 - ⚙️ **Adapter-agnostic**: works with any Better Auth database adapter, no extra infrastructure.
 
 ---
@@ -63,7 +63,7 @@
 
 Better Enrollment runs in one of two modes, auto-detected from your config: **invite-only** (every sign-up route is closed, invitations are the only way in) or **open** (normal sign-up, invites grant roles and organization membership). See [The two modes](https://better-enrollment.octopi.ai/docs/modes).
 
-**Private invites** are bound to one email. Creating one pre-creates an inert, unverified user with only the default role, which locks that address: until the invite is redeemed, database hooks refuse to verify that user, sign it in, or attach any account to it, on every path, without revealing that the invite exists. Withdrawing the invite removes the user. The link is emailed by your `sendPrivateInvitation` and never shown to its creator, so the token only ever exists in the recipient's mailbox. Redeeming it sets their password and marks the email **verified**: presenting the token is proof of mailbox access.
+**Private invites** are bound to one email. No account exists until the invite is redeemed: redemption creates it with the invited role, so there is nothing to sign into, verify or reset before then. The link is emailed by your `sendPrivateInvitation` and never shown to its creator, so the token only ever exists in the recipient's mailbox. Redeeming it sets their password and marks the email **verified**: presenting the token is proof of mailbox access.
 
 **Public invites** are shareable links with a use cap. Nothing is pre-created; the accepter types their own email at redemption, and since holding a shared link proves nothing about a mailbox, the account is created **unverified**. The plugin then sends Better Auth's standard verification email (when `sendOnSignUp` or `requireEmailVerification` is configured), and the user verifies by clicking it like any other signup.
 
@@ -187,23 +187,28 @@ Org invites (`org-join`, `org-create`), inviting existing accounts, and every fi
 
 ## The invite page
 
-Every invitation link points at the same page, carrying only `?token=`. The page calls `invite.get`, renders what `nextAction` says, and submits everything to `invite.redeem`; it never needs to know the invite kind or the mode.
+Every invitation link points at the same page, carrying only `#token=` (a fragment, so the token never reaches a server log). The page calls `invite.lookup`, renders what `nextAction` says, and submits everything to `invite.redeem`; it never needs to know the invite kind or the mode.
 
-| `invite.nextAction` | Meaning                       | What to render                               |
-| ------------------- | ----------------------------- | -------------------------------------------- |
-| `SIGN_UP`           | Invite-only, no session       | The fields listed in `requiredFields`        |
-| `SIGN_IN`           | Open mode, no session         | Your sign-in form; keep the token in the URL |
-| `CONFIRM`           | Open mode, session present    | A single confirm button                      |
-| `null`              | Expired, revoked, or consumed | A clear terminal message                     |
+| `invite.nextAction` | Meaning                       | What to render                                |
+| ------------------- | ----------------------------- | --------------------------------------------- |
+| `SIGN_UP`           | Invite-only, no session       | The fields listed in `requiredFields`         |
+| `SIGN_IN`           | Open mode, no session         | Your sign-in form; keep the token in the link |
+| `CONFIRM`           | Open mode, session present    | A single confirm button                       |
+| `null`              | Expired, revoked, or consumed | A clear terminal message                      |
 
 ```ts
-const { data: invite } = await authClient.invite.get({ token });
+const token = new URLSearchParams(location.hash.slice(1)).get("token");
+const { data: invite } = await authClient.invite.lookup({ token });
+
+await authClient.invite.redeem({ token, password, name });
+// private: { action: "ACCEPTED", organization? }
+await authClient.signIn.email({ email, password });
 
 await authClient.invite.redeem({ token, password, name, email });
-// -> { action: "ACCEPTED", organization? }
-
-await authClient.signIn.email({ email, password });
+// public: { action: "CHECK_EMAIL" }, the same for new and existing emails
 ```
+
+A public redemption never says whether the email already has an account. A new address gets its account and the verification email; an existing one gets the link through `sendExistingAccountNotice`, to open after signing in.
 
 Sign-up redemptions always collect `password` and `name`; public invites add `email`, and `org-create` adds `organizationName` and `organizationSlug` unless the invite presets the organization. Need more than that, say a department or a referral code? Declare [additional fields](https://better-enrollment.octopi.ai/docs/options#additional-fields) with a type, requiredness, an optional zod validator, and the steps that collect them (`SIGN_UP` by default, `CONFIRM` for signed-in activations), and they flow through `requiredFields` / `optionalFields`, the redeem body, and onto the user row:
 
@@ -217,7 +222,7 @@ betterEnrollment({
 });
 ```
 
-`invite.get` returns a deliberately thin payload: kind, role, derived status, expiry, uses remaining, and a masked email. Never the inviter's identity or internal ids. Full rendering guide: [The invite page](https://better-enrollment.octopi.ai/docs/invite-page).
+`invite.get` returns a deliberately thin payload: kind, role, derived status, expiry, and a masked email. Never the inviter's identity or internal ids. Full rendering guide: [The invite page](https://better-enrollment.octopi.ai/docs/invite-page).
 
 ---
 
@@ -250,8 +255,8 @@ Permissions table, seat math, and platform controls: [Organizations](https://bet
 
 ```ts
 // Redemption, for the invite page
-authClient.invite.get({ token });
-authClient.invite.lookup({ token }); // same, token in the body (fragment links)
+authClient.invite.lookup({ token }); // token in the body, for #token= links
+authClient.invite.get({ token }); // same, token in the query
 authClient.invite.redeem({ token, ... });
 
 // Management (admin- or org-gated)
@@ -305,19 +310,20 @@ betterEnrollment({
   mode: "auto", // "auto" | "invite-only" | "open"
   sendPrivateInvitation,
   sendPublicInvitation,
+  sendExistingAccountNotice, // public link redeemed with an existing account's email
   validRoles: ["user", "admin"],
   defaultRole: "user",
   expiresIn: 60 * 60 * 24 * 7,
   maxExpiresIn: 60 * 60 * 24 * 365, // cap on a caller-sent expiresIn; null = no cap
   resendCooldown: 60, // seconds between sends of one private invite; 0 = off
-  publicInviteRoles: ["user"], // roles a public link may grant (optional)
+  publicInviteRoles: ["user"], // roles a public link may grant (default: defaultRole; null = any)
   ac, // the admin plugin's access-control file, shared as-is
   roles, // roles with invite:<action> grants; falls back to adminRoles below
   adminRoles: ["admin"],
   grantableRoles: { support: ["user"] }, // roles granted without user:set-role (optional)
   passwordless: "auto", // magic-link apps: accept invites without a password
   additionalFields: {/* extra sign-up fields, see docs */},
-  buildInviteUrl, // or linkStyle: "fragment" to keep tokens out of URLs
+  buildInviteUrl, // optional; default links are baseURL/invite#token=...
   organization: {/* ... */},
   onInviteCreated,
   onInviteAccepted,
@@ -331,11 +337,11 @@ Every option with its default: [Options](https://better-enrollment.octopi.ai/doc
 
 ## Security
 
-While a private invite is pending, its pre-created user can only enter through redemption. Database hooks refuse to verify it, sign it in, or attach any account to it, whatever the path (verification mail, email OTP, password reset, OAuth, magic link, other plugins). Password reset requests also return a byte-identical silent success. Revoking, deleting, or letting the invite expire removes the never-redeemed user. Accepted invites are permanent audit records.
+A private invite creates no account: the account appears when the invite is redeemed, so verification mail, email OTP, password reset, OAuth and magic links have nothing to act on before then. Users pre-created by invites from before 1.0 keep their protection: database hooks refuse to verify them, sign them in, or attach any account to them until redemption, and withdrawing the invite removes them. Accepted invites are permanent audit records.
 
 Inviting is not assigning: an invite may grant a role other than the default only if its creator could assign that role directly (`user:set-role` for app roles, `member:update` for org roles) or `grantableRoles` allows it. The same applies when resending a public link, and when redeeming your own invite.
 
-The plugin does not close sign-up paths added by other plugins (magic link, email OTP, passkey and others): set their own `disableSignUp`. That and the rest of what your app must still do, the full block table, the email-lock semantics and token storage: [Security](https://better-enrollment.octopi.ai/docs/security#what-your-app-must-still-do). Report vulnerabilities privately to [talat@octopi.ai](mailto:talat@octopi.ai).
+In invite-only mode, accounts are created only by redemption, the admin plugin's `createUser`, or your own server code; sign-up paths added by other plugins (email OTP, anonymous, generic OAuth and others) are refused with `SIGN_UP_REQUIRES_INVITATION`. With `allowOpenSignup`, only addresses holding a pending private invite are refused. Still set those plugins' own `disableSignUp` so they stop before sending mail. What your app must still do, the full block table, the email-lock semantics and token storage: [Security](https://better-enrollment.octopi.ai/docs/security#what-your-app-must-still-do). Report vulnerabilities privately to [talat@octopi.ai](mailto:talat@octopi.ai).
 
 ---
 

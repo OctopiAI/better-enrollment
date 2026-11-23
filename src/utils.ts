@@ -48,10 +48,6 @@ export function compareNewestFirst(
 
 export { slugify } from "./validation";
 
-export async function storedTokenValue(token: string, hashTokens: boolean): Promise<string> {
-  return hashTokens ? sha256Base64Url(token) : token;
-}
-
 export function maskEmail(email: string): string {
   const at = email.indexOf("@");
   if (at <= 0) return "***";

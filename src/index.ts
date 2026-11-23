@@ -51,8 +51,7 @@ import {
   reservedSeats,
   sha256Base64Url,
   slugify,
-  splitRoles,
-  storedTokenValue
+  splitRoles
 } from "./utils";
 
 export * from "./access";
@@ -73,6 +72,15 @@ const PROVISIONING_SOURCE = { method: "invite" } as const;
 const REDEEM_PATHS = new Set(["/invite/accept", "/invite/redeem"]);
 const fromRedeem = (context: { path?: string } | null | undefined): boolean =>
   !!context?.path && REDEEM_PATHS.has(context.path);
+
+/** Better Auth's own answer to a sign-up for an email that already has an account. */
+const USER_ALREADY_EXISTS = {
+  code: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+  message: "User already exists. Use another email."
+};
+
+// Endpoints besides redemption that may create users in invite-only mode.
+const USER_CREATION_PATHS = new Set(["/admin/create-user"]);
 
 // Sign-in paths that need a credential or linked account, which a shell
 // cannot obtain (the account hook refuses it). The session hook skips its
@@ -292,7 +300,6 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     maxPublicUses: 10_000 as number | null,
     resendCooldown: 60,
     passwordless: "auto" as const,
-    hashTokens: true,
     autoVerifyPublicInviteEmail: false,
     exposeEmailOnGet: false,
     adminRoles: ["admin"],
@@ -419,7 +426,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     ctx: GenericEndpointContext,
     token: string
   ): Promise<Invite | null> {
-    const tokenHash = await storedTokenValue(token, opts.hashTokens);
+    const tokenHash = await sha256Base64Url(token);
     return await ctx.context.adapter.findOne<Invite>({
       model: "invite",
       where: [{ field: "tokenHash", value: tokenHash }]
@@ -456,6 +463,20 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     ctx: GenericEndpointContext,
     email: string
   ): Promise<boolean> {
+    return (await inviteOnlyState(ctx, email)).shell;
+  }
+
+  /**
+   * One read of the address's open invite-only invites: whether one still
+   * owns a user pre-created by 0.x, whether a private one is pending (past
+   * expiry included, like the email lock), and whether one is still live.
+   */
+  async function inviteOnlyState(
+    ctx: GenericEndpointContext,
+    email: string
+  ): Promise<{ shell: boolean; pendingPrivate: boolean; livePrivate: boolean }> {
+    let pendingPrivate = false;
+    let livePrivate = false;
     // Usually one page: an address holds one invite per scope.
     for (let offset = 0; ; offset += DB_PAGE) {
       const invites = await ctx.context.adapter.findMany<Invite>({
@@ -469,8 +490,13 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         offset,
         sortBy: { field: "id", direction: "asc" }
       });
-      if (invites.some((i) => i.preCreatedUserId)) return true;
-      if (invites.length < DB_PAGE) return false;
+      const privates = invites.filter((i) => i.status === "pending" && i.type === "private");
+      pendingPrivate ||= privates.length > 0;
+      livePrivate ||= privates.some((i) => !isExpired(i));
+      if (invites.some((i) => i.preCreatedUserId)) {
+        return { shell: true, pendingPrivate: true, livePrivate };
+      }
+      if (invites.length < DB_PAGE) return { shell: false, pendingPrivate, livePrivate };
     }
   }
 
@@ -516,7 +542,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       return opts.buildInviteUrl({ token, type, mode: getMode() });
     }
     const origin = new URL(ctx.context.baseURL).origin;
-    const sep = opts.linkStyle === "fragment" ? "#" : "?";
+    const sep = opts.linkStyle === "query" ? "?" : "#";
     return `${origin}/invite${sep}token=${encodeURIComponent(token)}`;
   }
 
@@ -636,14 +662,16 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     return holdsSetRole(user);
   }
 
-  /** publicInviteRoles and organization.publicInviteRoles; free when unset. */
+  /** publicInviteRoles and organization.publicInviteRoles; null allows any role. */
   function assertPublicRolesAllowed(
     invite: Pick<Invite, "type" | "kind" | "role" | "organizationRole">,
     status: "UNPROCESSABLE_ENTITY" | "FORBIDDEN"
   ): void {
     if (invite.type !== "public") return;
-    const appList = opts.publicInviteRoles;
-    const orgList = orgOpts?.publicInviteRoles;
+    const appList =
+      opts.publicInviteRoles === undefined ? [opts.defaultRole] : opts.publicInviteRoles;
+    const orgList =
+      orgOpts?.publicInviteRoles === undefined ? [defaultOrgRole()] : orgOpts.publicInviteRoles;
     const appOk = !appList || splitRoles(invite.role).every((r) => appList.includes(r));
     const orgOk =
       !orgList ||
@@ -746,7 +774,53 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     }
   }
 
-  async function assertUsable(invite: Invite | null): Promise<Invite> {
+  /**
+   * onInviteExpired at most once per invite: the reader that stamps
+   * expiryNotifiedAt fires it. Not updatedAt, which the resend cooldown reads.
+   */
+  async function notifyExpired(ctx: GenericEndpointContext, invite: Invite): Promise<void> {
+    if (!opts.onInviteExpired || invite.expiryNotifiedAt) return;
+    const stamped = await ctx.context.adapter.updateMany({
+      model: "invite",
+      where: [
+        { field: "id", value: invite.id },
+        { field: "expiryNotifiedAt", value: null }
+      ],
+      update: { expiryNotifiedAt: new Date() }
+    });
+    if (stamped > 0) await opts.onInviteExpired({ invite });
+  }
+
+  /**
+   * One existing-account notice per public invite and address per
+   * cooldown. First writer wins through Better Auth's verification store;
+   * an expired marker is replaced. Fails closed: no store, no mail.
+   */
+  async function noticeDue(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    email: string
+  ): Promise<boolean> {
+    const cooldown = opts.existingAccountNoticeCooldown ?? 24 * 60 * 60;
+    if (cooldown <= 0) return true;
+    const ia = ctx.context.internalAdapter;
+    const identifier = `better-enrollment-notice:${invite.id}:${email.toLowerCase()}`;
+    const marker = () => ({
+      identifier,
+      value: "1",
+      expiresAt: new Date(Date.now() + cooldown * 1000)
+    });
+    if (await ia.reserveVerificationValue(marker())) return true;
+    const prior = await ia.findVerificationValue(identifier);
+    if (prior && new Date(prior.expiresAt) > new Date()) return false;
+    await ia.deleteVerificationByIdentifier(identifier);
+    return await ia.reserveVerificationValue(marker());
+  }
+
+  async function assertUsable(
+    ctx: GenericEndpointContext,
+    invite: Invite | null
+  ): Promise<Invite> {
     if (!invite) {
       throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_NOT_FOUND);
     }
@@ -757,7 +831,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_ALREADY_USED);
     }
     if (isExpired(invite)) {
-      await opts.onInviteExpired?.({ invite });
+      await notifyExpired(ctx, invite);
       throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_EXPIRED);
     }
     return invite;
@@ -1082,7 +1156,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       invite.createdByUserId
     )) as BannableUser | null;
     let active = !!creator && !isBanned(creator);
-    if (active && opts.revalidateInviterOnRedeem) {
+    if (active && opts.revalidateInviterOnRedeem !== false && !invite.createdBySystem) {
       active = await inviterStillAuthorized(ctx, invite, creator!);
     }
     if (active) return invite;
@@ -1628,9 +1702,11 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     return org;
   }
 
-  /** The org plugin's organizationHooks, only with runOrgPluginHooks. */
+  /** The org plugin's organizationHooks, unless runOrgPluginHooks is false. */
   function orgPluginHooks(): OrgPluginLikeOptions["organizationHooks"] {
-    return orgOpts?.runOrgPluginHooks ? state.orgPluginOptions?.organizationHooks : undefined;
+    return orgOpts?.runOrgPluginHooks !== false
+      ? state.orgPluginOptions?.organizationHooks
+      : undefined;
   }
 
   /** Member row data, passed through the org plugin's beforeAddMember when enabled. */
@@ -1669,27 +1745,52 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
   }
 
   /**
+   * Public sign-up only: refuses a full org before the new/existing address
+   * split, so both get the same answer. A membershipLimit function needs a
+   * user and is left to the per-user check.
+   */
+  async function assertOrgHasRoom(
+    ctx: GenericEndpointContext,
+    invite: Invite,
+    org: OrganizationRecord
+  ): Promise<void> {
+    const seatLimit = await seatLimitFor(ctx, org);
+    const configured =
+      orgOpts?.respectMembershipLimit === false
+        ? null
+        : (state.orgPluginOptions?.membershipLimit || 100);
+    const membershipLimit = typeof configured === "number" ? configured : null;
+    if (seatLimit == null && membershipLimit == null) return;
+    const members = await ctx.context.adapter.count({
+      model: "member",
+      where: [{ field: "organizationId", value: org.id }]
+    });
+    await assertWithinMemberLimits(org, invite, members, seatLimit, membershipLimit);
+  }
+
+  /**
    * The org plugin's membershipLimit, applied exactly as the org plugin
-   * does (default 100), only with respectMembershipLimit.
+   * does (default 100), unless respectMembershipLimit is false.
    */
   async function orgPluginMembershipLimit(
     user: User,
     org: OrganizationRecord
   ): Promise<number | null> {
-    if (!orgOpts?.respectMembershipLimit) return null;
+    if (orgOpts?.respectMembershipLimit === false) return null;
     const configured = state.orgPluginOptions?.membershipLimit || 100;
     return typeof configured === "number" ? configured : await configured(user, org);
   }
 
   /**
-   * With runOrgPluginHooks, a numeric teams.maximumMembersPerTeam is
+   * Unless runOrgPluginHooks is false, a numeric teams.maximumMembersPerTeam is
    * honored: a full team is skipped like a deleted one (the member still
    * joins the org, teamAdded reports false).
    */
   async function teamHasRoom(c: AuthCtx, teamId: string): Promise<boolean> {
-    const max = orgOpts?.runOrgPluginHooks
-      ? state.orgPluginOptions?.teams?.maximumMembersPerTeam
-      : undefined;
+    const max =
+      orgOpts?.runOrgPluginHooks !== false
+        ? state.orgPluginOptions?.teams?.maximumMembersPerTeam
+        : undefined;
     if (typeof max !== "number") return true;
     const count = await c.adapter
       .count({ model: "teamMember", where: [{ field: "teamId", value: teamId }] })
@@ -1929,7 +2030,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
   async function acceptCore(ctx: GenericEndpointContext, body: RedeemBody) {
     const found = await findInviteByToken(ctx, body.token);
-    const invite = await assertUsable(found && (await settleInviter(ctx, found)));
+    const invite = await assertUsable(ctx, found && (await settleInviter(ctx, found)));
     assertPublicRolesAllowed(invite, "FORBIDDEN");
     const role = await resolveRole(invite);
 
@@ -1968,39 +2069,16 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
             invite.email!
           )) as MaybeWithAccounts | null
         );
-      // No account at all: the shell this invite relied on went with the
-      // invite that pre-created it (deleted, expired cleanup, org deletion),
-      // or was removed out of band. The token still proves the mailbox, so
-      // the accepter gets a fresh account instead of a dead end.
-      let createdShell = false;
-      if (!target) {
-        try {
-          target = await ctx.context.internalAdapter.createUser(
-            {
-              email: invite.email!,
-              name: "",
-              emailVerified: false,
-              role: opts.defaultRole
-            },
-            PROVISIONING_SOURCE
-          );
-          createdShell = true;
-        } catch (e) {
-          // validateUserInfo and database hook rejections keep their own error.
-          if (e instanceof APIError) throw e;
-          throw APIError.from("NOT_FOUND", INVITE_ERROR_CODES.PRE_CREATED_USER_MISSING);
+      if (target) {
+        if (isBanned(target)) {
+          throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.USER_BANNED);
         }
-      }
-      if (isBanned(target)) {
-        throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.USER_BANNED);
-      }
-      // An account someone can already sign into is never taken over by
-      // the token: merging into it requires the owner's session. That is
-      // any account holding a login, including this invite's own shell
-      // when an earlier failed attempt (before redemptions were undone)
-      // left a password on it; its owner signs in with that password.
-      // Another invite's verified shell counts as established too.
-      if (!createdShell) {
+        // An account someone can already sign into is never taken over by
+        // the token: merging into it requires the owner's session. That is
+        // any account holding a login, including this invite's own 0.x
+        // shell when an earlier failed attempt left a password on it; its
+        // owner signs in with that password. Another invite's verified
+        // shell counts as established too.
         const ownShell = invite.preCreatedUserId === target.id;
         const accounts = await ctx.context.internalAdapter.findAccounts(target.id);
         if (accounts.length > 0 || (!ownShell && target.emailVerified)) {
@@ -2009,28 +2087,44 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
             callbackURL: buildInviteUrl(ctx, body.token, invite.type)
           });
         }
-      }
-      await assertNotSelfGrant(ctx, invite, target.id);
-      const targetId = target.id;
-      const dropCreatedShell = async () => {
-        if (!createdShell) return;
-        await ctx.context.adapter
-          .delete({ model: "user", where: [{ field: "id", value: targetId }] })
-          .catch(() => {});
-      };
-      try {
+        await assertNotSelfGrant(ctx, invite, target.id);
         pre = await runBeforeOrgCreate(invite, target, pre);
-      } catch (e) {
-        await dropCreatedShell();
-        throw e;
       }
+      // Claim before creating a user: a submission that loses the claim has
+      // written nothing, so it can never remove the winner's account.
       const claimed = await claimUse(ctx, invite);
       if (!claimed) {
-        await dropCreatedShell();
         throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.INVITE_ALREADY_USED);
       }
-      const undo: Undo[] = [dropCreatedShell, () => rollbackClaim(ctx, invite)];
+      const undo: Undo[] = [() => rollbackClaim(ctx, invite)];
       try {
+        if (!target) {
+          // No account yet: the usual case, since invites no longer
+          // pre-create one. Created unverified with the default role, and
+          // completed below.
+          try {
+            target = await ctx.context.internalAdapter.createUser(
+              {
+                email: invite.email!,
+                name: "",
+                emailVerified: false,
+                role: opts.defaultRole
+              },
+              PROVISIONING_SOURCE
+            );
+          } catch (e) {
+            // validateUserInfo and database hook rejections keep their own error.
+            if (e instanceof APIError) throw e;
+            // Unique email: another invite for this address is being redeemed.
+            throw APIError.from("CONFLICT", INVITE_ERROR_CODES.REDEMPTION_IN_PROGRESS);
+          }
+          const createdId = target.id;
+          undo.push(() =>
+            ctx.context.adapter.delete({ model: "user", where: [{ field: "id", value: createdId }] })
+          );
+          pre = await runBeforeOrgCreate(invite, target, pre);
+        }
+        const targetId = target.id;
         // Everything that can refuse (seats, org plugin hooks, slug race)
         // runs before the user is touched. Hooks see the user as it is
         // about to be written.
@@ -2127,16 +2221,57 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         INVITE_ERROR_CODES.EMAIL_REQUIRED_FOR_PUBLIC_ACCEPT
       );
     }
+    // A full org refuses every address alike, before the split below.
+    if (invite.kind === "org-join" && pre.org) await assertOrgHasRoom(ctx, invite, pre.org);
     const existingUser = unwrapUser(
       (await ctx.context.internalAdapter.findUserByEmail(email)) as MaybeWithAccounts | null
     );
+    // New and existing addresses get the same answer, so the endpoint never
+    // confirms an account to an unauthenticated caller. The owner of an
+    // existing account is mailed the link instead; a signed-in redeem
+    // activates it.
+    const checkEmail = () => ctx.json({ action: "CHECK_EMAIL" as const });
     if (existingUser) {
-      // Do not confirm the account's existence to an unauthenticated
-      // caller. Send them through sign-in; a signed-in redeem activates.
-      return ctx.json({
-        action: "SIGN_IN_REQUIRED" as const,
-        callbackURL: buildInviteUrl(ctx, body.token, invite.type)
-      });
+      // Same hashing cost as a sign-up, so timing does not tell them apart.
+      if (body.password) await ctx.context.password.hash(body.password);
+      try {
+        if (
+          !opts.sendExistingAccountNotice ||
+          !(await noticeDue(ctx, invite, existingUser.email))
+        ) {
+          return checkEmail();
+        }
+        await opts.sendExistingAccountNotice(
+          {
+            email: existingUser.email,
+            name: existingUser.name,
+            role: invite.role,
+            kind: invite.kind,
+            mode: invite.mode,
+            url: buildInviteUrl(ctx, body.token, invite.type),
+            inviterName: invite.inviterName,
+            inviterEmail: invite.inviterEmail,
+            organizationName: pre.org?.name ?? invite.presetOrganizationName ?? null,
+            inviteId: invite.id,
+            organizationId: invite.organizationId,
+            organizationRole: invite.organizationRole,
+            teamId: invite.teamId,
+            expiresAt: invite.expiresAt
+          },
+          ctx.request
+        );
+      } catch (e) {
+        // A mail failure must not answer differently from the sign-up path.
+        ctx.context.logger.error("better-enrollment: sendExistingAccountNotice failed", e);
+      }
+      return checkEmail();
+    }
+    // An address with a live private invite enters only through that
+    // invite; a public link must not register it first. Same answer, nothing
+    // written, no use taken. An expired one no longer holds it here.
+    if ((await inviteOnlyState(ctx, email)).livePrivate) {
+      if (body.password) await ctx.context.password.hash(body.password);
+      return checkEmail();
     }
     const claimed = await claimUse(ctx, invite);
     if (!claimed) {
@@ -2144,16 +2279,25 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     }
     const undo: Undo[] = [() => rollbackClaim(ctx, invite)];
     try {
-      const user = await ctx.context.internalAdapter.createUser(
-        {
-          email,
-          name,
-          emailVerified: opts.autoVerifyPublicInviteEmail,
-          role,
-          ...extraFields
-        },
-        PROVISIONING_SOURCE
-      );
+      let user: User;
+      try {
+        user = await ctx.context.internalAdapter.createUser(
+          {
+            email,
+            name,
+            emailVerified: opts.autoVerifyPublicInviteEmail,
+            role,
+            ...extraFields
+          },
+          PROVISIONING_SOURCE
+        );
+      } catch (e) {
+        if (e instanceof APIError) throw e;
+        // Unique email: a parallel redemption registered the address first,
+        // which answers like an existing account.
+        await runUndo(ctx, undo);
+        return checkEmail();
+      }
       // The user created in THIS attempt must not outlive a failed
       // redemption, or the email would be locked while the invite stays
       // pending.
@@ -2172,7 +2316,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       pre = await runBeforeOrgCreate(invite, user, pre);
       // Refusals (seats, org plugin hooks, slug race) come before the
       // credential and the verification email.
-      const org = await applyOrgEffects(ctx, claimed, user, pre, undo);
+      await applyOrgEffects(ctx, claimed, user, pre, undo);
       if (body.password) {
         const hash = await ctx.context.password.hash(body.password);
         await ctx.context.internalAdapter.createAccount({
@@ -2208,20 +2352,9 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       await settlePublicStatus(ctx, claimed);
       await opts.onInviteAccepted?.({ invite: claimed, user });
       // No session is created or mutated, even passwordless: a public link
-      // proves nothing about the mailbox, so the accepter signs in through
-      // the app's own flow (credentials just set, or their first magic
-      // link, which also verifies the email).
-      return ctx.json({
-        action: "ACCEPTED" as const,
-        signedIn: false,
-        user: {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          emailVerified: user.emailVerified
-        },
-        organization: org ? { id: org.id, name: org.name, slug: org.slug } : null
-      });
+      // proves nothing about the mailbox, so the accepter verifies it and
+      // signs in through the app's own flow.
+      return checkEmail();
     } catch (e) {
       await runUndo(ctx, undo);
       throw e;
@@ -2230,7 +2363,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
   async function activateCore(ctx: GenericEndpointContext, body: RedeemBody) {
     const found = await findInviteByToken(ctx, body.token);
-    const invite = await assertUsable(found && (await settleInviter(ctx, found)));
+    const invite = await assertUsable(ctx, found && (await settleInviter(ctx, found)));
     assertPublicRolesAllowed(invite, "FORBIDDEN");
 
     const session = await getSessionFromCtx(ctx);
@@ -2354,9 +2487,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     // An inactive inviter shows as revoked here, not only at redeem.
     const invite = await settleInviter(ctx, found);
     const status = deriveStatus(invite);
-    if (status === "expired") {
-      await opts.onInviteExpired?.({ invite });
-    }
+    if (status === "expired") await notifyExpired(ctx, invite);
 
     let organizationName: string | null = null;
     if (invite.kind === "org-join" && invite.organizationId && orgEnabled()) {
@@ -2428,11 +2559,10 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       requiredFields,
       optionalFields,
       additionalFields,
+      // No use counts: only a new address consumes a use, so they would
+      // tell a link holder which emails have accounts. invite.list has them.
       expiresAt: invite.expiresAt,
-      maxUses: invite.maxUses,
-      useCount: invite.useCount,
-      usesRemaining:
-        invite.maxUses == null ? null : Math.max(0, invite.maxUses - invite.useCount)
+      maxUses: invite.maxUses
     });
   }
 
@@ -2609,15 +2739,14 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
     const inviterName = actor.type === "system" ? actor.inviterName : (creator?.name ?? "");
     const inviterEmail = actor.type === "system" ? actor.inviterEmail : (creator?.email ?? "");
 
-    let emailHasUser = false;
     if (email) {
       // The email lock is per scope: one pending row per (kind, org), held
       // even past expiresAt, where resend is the release valve. Invites in
       // other scopes always coexist (one email invited to several orgs, or
       // to the app and an org): redemption is state-driven, so whichever
-      // live token is redeemed first claims the shell and the rest become
-      // activations. Scoping also keeps an org inviter from probing for
-      // pending invites elsewhere in the app.
+      // live token is redeemed first creates the account and the rest
+      // become activations. Scoping also keeps an org inviter from probing
+      // for pending invites elsewhere in the app.
       const existing = await ctx.context.adapter.findOne<Invite>({
         model: "invite",
         where: [
@@ -2633,46 +2762,25 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
       const existingUser = unwrapUser(
         (await ctx.context.internalAdapter.findUserByEmail(email)) as MaybeWithAccounts | null
       );
-      if (existingUser && mode === "invite-only") {
-        // An org-bound invite to an established account is an activation
-        // invite: redeem merges the membership onto the signed-in user.
-        // App-kind invites grant nothing an established user lacks. An
-        // inert shell pre-created by another invite is neither: this
-        // invite skips pre-creation (the email is taken) and its token
-        // claims the shell at redemption like any other sign-up.
-        if (kind === "app" && (await isEstablished(ctx, existingUser))) {
-          throw APIError.from("CONFLICT", INVITE_ERROR_CODES.USER_ALREADY_EXISTS);
-        }
-        emailHasUser = true;
+      // An org-bound invite to an established account is an activation
+      // invite: redeem merges the membership onto the signed-in user.
+      // App-kind invites grant nothing an established user lacks. A user
+      // pre-created by an invite from before 1.0 is neither; its token
+      // claims it at redemption like any other sign-up.
+      if (
+        existingUser &&
+        mode === "invite-only" &&
+        kind === "app" &&
+        (await isEstablished(ctx, existingUser))
+      ) {
+        throw APIError.from("CONFLICT", INVITE_ERROR_CODES.USER_ALREADY_EXISTS);
       }
     }
 
     const expiresAt = inviteExpiresAt(body.expiresIn, type);
 
-    let preCreatedUserId: string | null = null;
-    if (mode === "invite-only" && type === "private" && email && !emailHasUser) {
-      try {
-        const created = await ctx.context.internalAdapter.createUser(
-          {
-            email,
-            name: body.name ?? "",
-            emailVerified: false,
-            // The invited role is written at redemption only.
-            role: opts.defaultRole
-          },
-          PROVISIONING_SOURCE
-        );
-        preCreatedUserId = created.id;
-      } catch (e) {
-        if (e instanceof APIError) throw e;
-        // Unique-email race: a concurrent create pre-created this
-        // user between our conflict check and now.
-        throw APIError.from("CONFLICT", INVITE_ERROR_CODES.EMAIL_ALREADY_INVITED);
-      }
-    }
-
     const token = generateRandomString(32);
-    const tokenHash = await storedTokenValue(token, opts.hashTokens);
+    const tokenHash = await sha256Base64Url(token);
     const now = new Date();
 
     try {
@@ -2693,8 +2801,9 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           presetSeatLimit: kind === "org-create" ? (body.presetSeatLimit ?? null) : null,
           presetOrganizationName: body.organization?.name ?? null,
           presetOrganizationSlug: body.organization?.slug ?? null,
-          preCreatedUserId,
+          preCreatedUserId: null,
           createdByUserId,
+          createdBySystem: actor.type === "system",
           inviterName,
           inviterEmail,
           expiresAt,
@@ -2702,16 +2811,16 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           useCount: 0,
           revokedAt: null,
           revokedByUserId: null,
+          expiryNotifiedAt: null,
           createdAt: now,
           updatedAt: now
         }
       });
 
-      // The email lock is a read then a write. A shell's unique email
-      // serializes parallel creates; without one, count the scope after
+      // The email lock is a read then a write: count the scope after
       // writing and back out when another create got in (both may, which
       // leaves none rather than two; the creator retries).
-      if (email && !preCreatedUserId) {
+      if (email) {
         const pending = await ctx.context.adapter.count({
           model: "invite",
           where: [
@@ -2728,7 +2837,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
 
       // Write, then verify (see seatUsage): parallel creates can all pass
       // the check above. Over the limit, the catch below removes this
-      // invite and its shell. Seat-limited orgs only.
+      // invite. Seat-limited orgs only.
       if (org && kind === "org-join") {
         const limit = await seatLimitFor(ctx, org);
         if (limit != null) {
@@ -2801,14 +2910,6 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           where: [{ field: "tokenHash", value: tokenHash }]
         })
         .catch(() => {});
-      if (preCreatedUserId) {
-        await ctx.context.adapter
-          .delete({
-            model: "user",
-            where: [{ field: "id", value: preCreatedUserId }]
-          })
-          .catch(() => {});
-      }
       throw e;
     }
   }
@@ -2841,7 +2942,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           );
         }
         ctx.logger.info(
-          `better-enrollment: mode "${state.mode}" auto-detected (${describePaths(paths)}). Sign-up paths from other plugins are not detectable; set mode explicitly if you use any.`
+          `better-enrollment: mode "${state.mode}" auto-detected (${describePaths(paths)}). Sign-up paths from other plugins are not detected${state.mode === "invite-only" ? " and cannot create accounts in invite-only mode" : ""}; set mode explicitly if you use any.`
         );
       } else {
         state.mode = opts.mode;
@@ -2871,13 +2972,8 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         );
       }
       if (!opts.buildInviteUrl && !ctx.baseURL) {
-        ctx.logger.warn(
-          "better-enrollment: neither baseURL (or BETTER_AUTH_URL) nor buildInviteUrl is set, so invite links use the host of each request. Set baseURL or buildInviteUrl; the next major version will require one."
-        );
-      }
-      if (options.hashTokens === false) {
-        ctx.logger.warn(
-          "better-enrollment: hashTokens: false stores live invite links in the database, readable by anyone who can read it. The option is deprecated and will be removed in the next major version."
+        throw new Error(
+          "better-enrollment: set baseURL (or BETTER_AUTH_URL) or buildInviteUrl, so invite links point at your app and not at the host a request names."
         );
       }
       if (
@@ -2922,7 +3018,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         ];
         if (problems.length > 0) {
           const msg = `better-enrollment: a grantable role must not exceed its holder's permissions, since the holder can redeem it through a second account.\n  ${problems.join("\n  ")}`;
-          if (opts.grantableRolesCheck === "error") throw new Error(msg);
+          if ((opts.grantableRolesCheck ?? "error") === "error") throw new Error(msg);
           ctx.logger.warn(msg);
         }
       }
@@ -2983,6 +3079,42 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         options: {
           databaseHooks: {
             user: {
+              create: {
+                // Backstop for sign-up paths mode detection cannot see (other
+                // plugins). Invite-only: accounts come from redemption, the
+                // admin plugin, or server code outside a request. With
+                // allowOpenSignup only invited addresses are held back.
+                before: async (user, context) => {
+                  if (state.mode !== "invite-only" || !context) return;
+                  if (fromRedeem(context) || USER_CREATION_PATHS.has(context.path)) return;
+                  if (opts.allowOpenSignup) {
+                    const email = (user as { email?: unknown }).email;
+                    if (typeof email !== "string" || !email) return;
+                    const invited = await (await adapterOf(context)).findOne<Invite>({
+                      model: "invite",
+                      where: [
+                        { field: "email", value: email.toLowerCase() },
+                        { field: "mode", value: "invite-only" },
+                        { field: "type", value: "private" },
+                        { field: "status", value: "pending" }
+                      ]
+                    });
+                    if (!invited) return;
+                    // Answer as for an address that already has an account,
+                    // so open paths never single out invited addresses. With
+                    // duplicate hiding on, /sign-up/email turns a 403 here
+                    // into its generic duplicate response (Better Auth 1.7).
+                    const ep = ctx.options.emailAndPassword;
+                    const hidesDuplicates =
+                      !!ep?.requireEmailVerification || ep?.autoSignIn === false;
+                    throw APIError.from(
+                      hidesDuplicates ? "FORBIDDEN" : "UNPROCESSABLE_ENTITY",
+                      USER_ALREADY_EXISTS
+                    );
+                  }
+                  throw APIError.from("FORBIDDEN", INVITE_ERROR_CODES.SIGN_UP_REQUIRES_INVITATION);
+                }
+              },
               update: {
                 before: async (data, context) => {
                   if (!context) return;
@@ -3140,8 +3272,9 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
         },
         {
           // Magic-link verify signs in EXISTING users regardless of its
-          // disableSignUp, and a pre-created invite shell exists. Without
-          // this guard the invitee could skip the invite flow entirely.
+          // disableSignUp, and an invite from 0.x may still own a
+          // pre-created user. Without this guard its invitee could skip
+          // the invite flow entirely.
           // The token is resolved to its email without consuming it, using
           // the same storeToken transform the magic-link plugin configured.
           matcher: (ctx) => ctx.path === "/magic-link/verify",
@@ -3176,16 +3309,22 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           })
         },
         {
-          // Sending a magic link to a pre-created shell would deliver a
-          // link the verify guard rejects. Reply with the endpoint's exact
-          // success body without sending, mirroring the password-reset
-          // guard: no dead link in the inbox, no invite oracle.
+          // An invited address without an account (or with a 0.x shell)
+          // enters only through its invite, so a magic link would be
+          // refused on verify. Reply with the endpoint's exact success body
+          // without sending, mirroring the password-reset guard: no dead
+          // link in the inbox, no invite oracle.
           matcher: (ctx) => ctx.path === "/sign-in/magic-link",
           handler: createAuthMiddleware(async (ctx) => {
             if (state.mode !== "invite-only" || !state.magicLinkOptions) return;
             const email = bodyEmail(ctx);
             if (!email) return;
-            if (await hasPendingShellInvite(ctx, email)) {
+            const invited = await inviteOnlyState(ctx, email);
+            if (
+              invited.shell ||
+              (invited.pendingPrivate &&
+                !(await ctx.context.internalAdapter.findUserByEmail(email)))
+            ) {
               return new Response(JSON.stringify({ status: true }), {
                 status: 200,
                 headers: { "content-type": "application/json" }
@@ -3373,12 +3512,15 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
               { field: "kind", value: "org-join" }
             ];
             const scope = { userId: member.userId, organizationId: member.organizationId };
+            // System invites attributed to the member never relied on its org rights.
+            const system = (invite: Invite) => !!invite.createdBySystem;
             if (ctx.path !== "/organization/update-member-role") {
               await cancelPendingInvites(
                 ctx.context,
                 where,
                 ctx.path === "/organization/leave" ? "inviter-left-org" : "inviter-removed-from-org",
-                scope
+                scope,
+                system
               );
               return;
             }
@@ -3392,10 +3534,15 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
               where,
               "inviter-role-changed",
               scope,
-              mayCreate
-                ? (invite) =>
-                    canGrantOrgRole(ctx, member, org, invite.organizationRole ?? defaultOrgRole())
-                : undefined
+              async (invite) =>
+                system(invite) ||
+                (mayCreate &&
+                  (await canGrantOrgRole(
+                    ctx,
+                    member,
+                    org,
+                    invite.organizationRole ?? defaultOrgRole()
+                  )))
             );
           })
         }
@@ -3532,7 +3679,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
           }
 
           const token = generateRandomString(32);
-          const tokenHash = await storedTokenValue(token, opts.hashTokens);
+          const tokenHash = await sha256Base64Url(token);
           const expiresAt = inviteExpiresAt(ctx.body.expiresIn, invite.type);
           // Private resends mail a third party: one per cooldown, enforced
           // in the CAS so parallel resends send once. Public invites change
@@ -3555,7 +3702,7 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
                 ? [{ field: "updatedAt", value: cooldownSince, operator: "lte" as const }]
                 : [])
             ],
-            update: { tokenHash, expiresAt, updatedAt: new Date() }
+            update: { tokenHash, expiresAt, expiryNotifiedAt: null, updatedAt: new Date() }
           });
           if (!updated) {
             const now = cooldownSince
@@ -3583,7 +3730,11 @@ export const betterEnrollment = (options: BetterEnrollmentOptions) => {
                     { field: "id", value: invite.id },
                     { field: "tokenHash", value: tokenHash }
                   ],
-                  update: { tokenHash: invite.tokenHash, expiresAt: invite.expiresAt }
+                  update: {
+                    tokenHash: invite.tokenHash,
+                    expiresAt: invite.expiresAt,
+                    expiryNotifiedAt: invite.expiryNotifiedAt ?? null
+                  }
                 });
                 await orgOpts?.onSeatLimitReached?.({ organization: org });
                 throw APIError.from("UNPROCESSABLE_ENTITY", INVITE_ERROR_CODES.SEAT_LIMIT_REACHED);
