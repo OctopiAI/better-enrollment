@@ -33,12 +33,15 @@ const inviteFields = {
   preCreatedUserId: { type: "string", required: false, input: false, index: true },
   // No FK: accepted invites outlive their inviter (denormalized fields).
   createdByUserId: { type: "string", required: false, input: false, index: true },
+  // createSystemInvite: no inviter rights to re-check. Null on 0.x rows.
+  createdBySystem: { type: "boolean", required: false, input: false },
   inviterName: { type: "string", required: true, input: false },
   inviterEmail: { type: "string", required: true, input: false },
   expiresAt: { type: "date", required: false, input: false, index: true },
   maxUses: { type: "number", required: false, input: false },
   useCount: { type: "number", required: true, input: false, defaultValue: 0 },
   revokedAt: { type: "date", required: false, input: false },
+  expiryNotifiedAt: { type: "date", required: false, input: false },
   revokedByUserId: { type: "string", required: false, input: false },
   createdAt: { type: "date", required: true, input: false },
   updatedAt: { type: "date", required: true, input: false }

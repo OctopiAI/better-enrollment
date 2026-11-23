@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import type { BetterEnrollmentOptions } from "../src";
 import {
+  addLegacyShell,
   createTestAuth,
   findAccounts,
   findInviteRow,
@@ -107,7 +108,7 @@ describe("passwordless redemption (magic link)", () => {
     expect(verified.headers.get("set-cookie")).toContain("session_token");
   });
 
-  it("suppresses magic-link delivery for a pre-created shell, with the normal success body", async () => {
+  it("suppresses magic-link delivery for an invited address without an account, with the normal success body", async () => {
     const { auth, links } = await createMagicLinkAuth();
     await createSystemPrivateInvite(auth, "invitee@test.com");
     const res = await api(auth).signInMagicLink({
@@ -120,7 +121,7 @@ describe("passwordless redemption (magic link)", () => {
     expect(links.filter((l) => l.email === "invitee@test.com")).toHaveLength(0);
   });
 
-  it("blocks a magic link already in flight once the invite shell exists", async () => {
+  it("blocks a magic link already in flight once a 0.x invite shell exists", async () => {
     const { auth, links } = await createMagicLinkAuth();
     // The link was requested before the invite existed, so it was sent.
     await api(auth).signInMagicLink({
@@ -129,6 +130,7 @@ describe("passwordless redemption (magic link)", () => {
     });
     const link = links.at(-1)!;
     const { inviteId } = await createSystemPrivateInvite(auth, "invitee@test.com");
+    await addLegacyShell(auth, inviteId);
 
     expect(
       await errCode(
@@ -150,7 +152,8 @@ describe("passwordless redemption (magic link)", () => {
       headers: new Headers()
     });
     const link = links.at(-1)!;
-    await createSystemPrivateInvite(auth, "invitee@test.com");
+    const { inviteId } = await createSystemPrivateInvite(auth, "invitee@test.com");
+    await addLegacyShell(auth, inviteId);
 
     const res = await auth.handler(
       new Request(
@@ -212,13 +215,10 @@ describe("passwordless redemption (magic link)", () => {
 
     const row = await findInviteRow(auth, inviteId);
     expect(row?.status).toBe("pending");
-    const user = await findUserByEmail(auth, "invitee@test.com");
+    // The account created for the attempt went with its session.
+    expect(await findUserByEmail(auth, "invitee@test.com")).toBeNull();
     const ctx = await auth.$context;
-    const sessions = await ctx.adapter.findMany({
-      model: "session",
-      where: [{ field: "userId", value: user!.id }]
-    });
-    expect(sessions).toHaveLength(0);
+    expect(await ctx.adapter.findMany({ model: "session" })).toHaveLength(0);
 
     boom = false;
     const res = await api(auth).acceptInvite({ body: { token, name: "Invitee" } });
@@ -240,8 +240,7 @@ describe("passwordless redemption (magic link)", () => {
     const res = await api(auth).acceptInvite({
       body: { token: created.token!, name: "Pub", email: "pub@test.com" }
     });
-    expect(res.action).toBe("ACCEPTED");
-    expect(res.signedIn).toBe(false);
+    expect(res).toEqual({ action: "CHECK_EMAIL" });
     let user = await findUserByEmail(auth, "pub@test.com");
     // A public link proves nothing about the mailbox.
     expect(user?.emailVerified).toBe(false);

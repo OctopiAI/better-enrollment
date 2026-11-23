@@ -2,9 +2,9 @@ import { organization } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import type { BetterEnrollmentOptions } from "../src/types";
 import {
+  addLegacyShell,
   createInvite,
   createTestAuth,
-  findAccounts,
   findInviteRow,
   findUserByEmail,
   seedAdmin,
@@ -94,10 +94,7 @@ describe("failed redemptions leave nothing behind (BE-LIB-09)", () => {
       api(auth).redeemInvite({ body: { token: inv.token, password: PASS, name: "Late" } })
     );
     expect(refused).toBe("SEAT_LIMIT_REACHED");
-    const user = await findUserByEmail(auth, "late@new.com");
-    expect(user?.emailVerified).toBe(false);
-    expect(user?.name).toBe("");
-    expect(await findAccounts(auth, user!.id)).toHaveLength(0);
+    expect(await findUserByEmail(auth, "late@new.com")).toBeNull();
     expect(await signInStatus(auth, "late@new.com", PASS)).toBe(401);
     expect(await rows(auth, "inviteUse", "inviteId", inv.inviteId)).toHaveLength(0);
     const row = await findInviteRow(auth, inv.inviteId);
@@ -122,17 +119,16 @@ describe("failed redemptions leave nothing behind (BE-LIB-09)", () => {
       body: { kind: "org-join", email: "undo@new.com", organizationId: org.id },
       headers: ownerHeaders
     });
+    const members = (await rows(auth, "member", "organizationId", org.id)).length;
+    const accounts = (await rows(auth, "account", "providerId", "credential")).length;
     fail.on = true;
     expect(
       await code(api(auth).redeemInvite({ body: { token: inv.token, password: PASS, name: "Undo" } }))
     ).toBe("hook refused");
 
-    const user = await findUserByEmail(auth, "undo@new.com");
-    expect(user?.emailVerified).toBe(false);
-    expect(user?.name).toBe("");
-    expect((user as { role?: string } | null)?.role).toBe("user");
-    expect(await findAccounts(auth, user!.id)).toHaveLength(0);
-    expect(await rows(auth, "member", "userId", user!.id)).toHaveLength(0);
+    expect(await findUserByEmail(auth, "undo@new.com")).toBeNull();
+    expect(await rows(auth, "account", "providerId", "credential")).toHaveLength(accounts);
+    expect(await rows(auth, "member", "organizationId", org.id)).toHaveLength(members);
     expect(await rows(auth, "inviteUse", "inviteId", inv.inviteId)).toHaveLength(0);
     expect((await findInviteRow(auth, inv.inviteId))?.status).toBe("pending");
 
@@ -160,8 +156,7 @@ describe("failed redemptions leave nothing behind (BE-LIB-09)", () => {
     };
     expect(await code(api(auth).redeemInvite({ body }))).toBe("hook refused");
     expect(await rows(auth, "organization", "slug", "newco")).toHaveLength(0);
-    const founder = await findUserByEmail(auth, "founder@newco.com");
-    expect(await rows(auth, "member", "userId", founder!.id)).toHaveLength(0);
+    expect(await findUserByEmail(auth, "founder@newco.com")).toBeNull();
 
     fail.on = false;
     const ok = await api(auth).redeemInvite({ body });
@@ -218,9 +213,9 @@ describe("failed redemptions leave nothing behind (BE-LIB-09)", () => {
       body: { kind: "org-join", email: "residue@new.com", organizationId: org.id },
       headers: ownerHeaders
     });
-    // What a failed attempt left behind before redemptions were undone.
+    // What a failed 0.x attempt left on a pre-created user.
     const ctx = await auth.$context;
-    const shell = await findUserByEmail(auth, "residue@new.com");
+    const shell = await addLegacyShell(auth, inv.inviteId);
     await ctx.adapter.create({
       model: "account",
       data: {

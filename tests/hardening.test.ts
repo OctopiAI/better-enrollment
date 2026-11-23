@@ -121,41 +121,26 @@ describe("BE-LIB-16 hardening", () => {
     expect(left).toBe(0);
   });
 
-  it("(f, g) warns at startup about request-derived link hosts and unhashed tokens", async () => {
-    const warningsFor = async (auth: Record<string, unknown>, invite: Record<string, unknown>) => {
-      const warnings: string[] = [];
-      await createTestAuth({
-        invite,
-        auth: {
-          ...auth,
-          logger: {
-            log: (level: string, message: string) => {
-              if (level === "warn") warnings.push(message);
-            }
-          }
-        }
-      });
-      return warnings.filter((w) => w.startsWith("better-enrollment"));
-    };
-    const host = (w: string[]) => w.filter((m) => m.includes("buildInviteUrl"));
-    const hash = (w: string[]) => w.filter((m) => m.includes("hashTokens"));
+  it("(f) refuses to start without a fixed host for invite links", async () => {
     const saved = process.env.BETTER_AUTH_URL;
     delete process.env.BETTER_AUTH_URL;
     try {
-      expect(host(await warningsFor({ baseURL: undefined }, {}))).toHaveLength(1);
-      expect(
-        host(await warningsFor({ baseURL: undefined }, { buildInviteUrl: () => "https://x.test" }))
-      ).toHaveLength(0);
+      await expect(createTestAuth({ auth: { baseURL: undefined } })).rejects.toThrow(
+        /baseURL .* or buildInviteUrl/
+      );
+      await expect(
+        createTestAuth({
+          auth: { baseURL: undefined },
+          invite: { buildInviteUrl: () => "https://x.test" }
+        })
+      ).resolves.toBeTruthy();
     } finally {
       if (saved !== undefined) process.env.BETTER_AUTH_URL = saved;
     }
-    expect(host(await warningsFor({}, {}))).toHaveLength(0);
-    expect(hash(await warningsFor({}, { hashTokens: false }))).toHaveLength(1);
-    expect(hash(await warningsFor({}, {}))).toHaveLength(0);
   });
 
-  it("fragment links and POST lookups keep the token out of URLs", async () => {
-    const auth = await createTestAuth({ invite: { linkStyle: "fragment" } });
+  it("fragment links (the default) and POST lookups keep the token out of URLs", async () => {
+    const auth = await createTestAuth();
     const admin = await seedAdmin(auth);
     const inv = await auth.api.createInvite({ body: { type: "public" }, headers: admin });
     expect(inv.url).toBe(`http://localhost:3000/invite#token=${encodeURIComponent(inv.token!)}`);
@@ -174,16 +159,17 @@ describe("BE-LIB-16 hardening", () => {
     expect(res.status).toBe(200);
     expect(res.url).not.toContain(inv.token!);
 
-    const query = await createTestAuth();
+    const query = await createTestAuth({ invite: { linkStyle: "query" } });
     const queryAdmin = await seedAdmin(query);
     const plain = await query.api.createInvite({ body: { type: "public" }, headers: queryAdmin });
     expect(plain.url).toContain("/invite?token=");
   });
 
-  it("(e) publicInviteRoles limits what public links grant, old links included", async () => {
+  it("(e) public links grant only the default roles by default, old links included", async () => {
+    // undefined restores the plugin default the test helper turns off.
     const auth = await createTestAuth({
       plugins: [organization()],
-      invite: { publicInviteRoles: ["user"], organization: { publicInviteRoles: ["member"] } }
+      invite: { publicInviteRoles: undefined, organization: { publicInviteRoles: undefined } }
     });
     const admin = await seedAdmin(auth);
     // biome-ignore lint/suspicious/noExplicitAny: dynamic endpoint access
@@ -197,7 +183,7 @@ describe("BE-LIB-16 hardening", () => {
       headers: admin
     });
 
-    // A link issued before the option was set no longer redeems.
+    // A link issued before upgrading no longer redeems.
     await insertInviteRow(auth, { token: "old-admin-link", type: "public", role: "admin" });
     expect(
       await code(

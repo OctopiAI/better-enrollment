@@ -178,10 +178,7 @@ describe("an owner invite needs its creator to still be an owner", () => {
   });
 
   it("redemption re-checks it when the demotion bypassed the org plugin", async () => {
-    // revalidateInviterOnRedeem is opt-in before 1.0.
-    const { auth, org } = await setup({
-      invite: { revalidateInviterOnRedeem: true, organization: { allowOwnerInvites: true } }
-    });
+    const { auth, org } = await setup({ invite: { organization: { allowOwnerInvites: true } } });
     const o2 = await addMember(auth, org.id, "o2@acme.com", "owner");
     await createInvite(auth, {
       body: {

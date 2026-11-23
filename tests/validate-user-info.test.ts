@@ -52,17 +52,18 @@ const [major, minor] = installed.version.split(".").map(Number);
 const hasGate = major! > 1 || (major === 1 && minor! >= 7);
 
 describe.runIf(hasGate)("user.validateUserInfo (Better Auth >= 1.7)", () => {
-  it("private invite: the pre-created shell passes the gate with method invite", async () => {
+  it("private invite: the user created at redemption passes the gate with method invite", async () => {
     const { auth, headers, seen } = await gatedAuth();
     const invite = await createInvite(auth, {
       body: { type: "private", email: "ok@test.com" },
       headers
     });
-    expect(seen).toContainEqual({ email: "ok@test.com", method: "invite", action: "create-user" });
+    expect(seen).toEqual([]);
 
     await auth.api.acceptInvite({
       body: { token: invite.token, password: "password123", name: "Invitee" }
     });
+    expect(seen).toContainEqual({ email: "ok@test.com", method: "invite", action: "create-user" });
     expect((await findUserByEmail(auth, "ok@test.com"))?.emailVerified).toBe(true);
   });
 
@@ -85,13 +86,21 @@ describe.runIf(hasGate)("user.validateUserInfo (Better Auth >= 1.7)", () => {
     expect(await findUserByEmail(auth, "public@test.com")).toBeTruthy();
   });
 
-  it("a rejection at invite creation surfaces as the gate's error, not EMAIL_ALREADY_INVITED", async () => {
+  it("a rejection at private redemption surfaces the gate's error and keeps the invite", async () => {
     const { auth, headers } = await gatedAuth();
+    const invite = await createInvite(auth, {
+      body: { type: "private", email: "x@blocked.com" },
+      headers
+    });
     const err = await captureError(() =>
-      auth.api.createInvite({ body: { type: "private", email: "x@blocked.com" }, headers })
+      auth.api.acceptInvite({
+        body: { token: invite.token, password: "password123", name: "Blocked" }
+      })
     );
     expect(err).toMatchObject({ status: "FORBIDDEN", code: "domain_not_allowed" });
     expect(await findUserByEmail(auth, "x@blocked.com")).toBeFalsy();
+    const row = await findInviteRow(auth, invite.inviteId);
+    expect(row).toMatchObject({ useCount: 0, status: "pending" });
   });
 
   it("a rejection at public redemption surfaces the gate's error and returns the use", async () => {

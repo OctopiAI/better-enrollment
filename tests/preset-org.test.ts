@@ -6,7 +6,6 @@ import type { PrivateInvitationEmailData, PublicInvitationData } from "../src/ty
 import {
   createInvite,
   createTestAuth,
-  findAccounts,
   findInviteRow,
   findUserByEmail,
   seedAdmin,
@@ -218,7 +217,8 @@ describe("preset organization on org-create invites", () => {
     const redeemed = await api(auth).redeemInvite({
       body: { token: res.token, password: PASSWORD, name: "Founder", email: "sys@co.com" }
     });
-    expect(redeemed.organization).toMatchObject({ name: "System Co", slug: "system-co" });
+    expect(redeemed.action).toBe("CHECK_EMAIL");
+    expect(await findOrgBySlug(auth, "system-co")).toMatchObject({ name: "System Co" });
   });
 
   it("rejects a preset on kinds other than org-create", async () => {
@@ -358,9 +358,8 @@ describe("organization.beforeOrgCreate", () => {
     expect(row?.status).toBe("pending");
     expect(row?.useCount).toBe(0);
     expect(await findOrgBySlug(auth, "refused")).toBeNull();
-    const shell = await findUserByEmail(auth, "founder@refused.com");
-    expect(shell?.emailVerified).toBe(false);
-    expect(await findAccounts(auth, shell!.id)).toHaveLength(0);
+    // The account created for the attempt is gone again.
+    expect(await findUserByEmail(auth, "founder@refused.com")).toBeNull();
 
     refuse = false;
     const res = await redeem();
@@ -393,7 +392,8 @@ describe("organization.beforeOrgCreate", () => {
     expect(await findUserByEmail(auth, "p@pub.com")).toBeFalsy();
 
     refuse = false;
-    expect((await redeem()).organization.slug).toBe("pub");
+    expect((await redeem()).action).toBe("CHECK_EMAIL");
+    expect(await findOrgBySlug(auth, "pub")).toBeTruthy();
   });
 
   it("a throw on a signed-in activation leaves the invite pending", async () => {

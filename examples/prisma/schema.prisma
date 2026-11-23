@@ -30,6 +30,7 @@ model Invite {
   presetOrganizationSlug String? // org-create: fixed slug (suffixed on conflict)
   preCreatedUserId String?
   createdByUserId  String?
+  createdBySystem  Boolean?
   inviterName      String
   inviterEmail     String
   expiresAt        DateTime?
@@ -37,6 +38,7 @@ model Invite {
   useCount         Int       @default(0)
   revokedAt        DateTime?
   revokedByUserId  String?
+  expiryNotifiedAt DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
   uses             InviteUse[]
