@@ -46,18 +46,7 @@ export function compareNewestFirst(
   return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
 }
 
-/** URL-safe slug for an org name; "org" when nothing usable remains. */
-export function slugify(name: string): string {
-  const slug = name
-    .normalize("NFKD")
-    .replace(/\p{M}/gu, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48)
-    .replace(/-+$/, "");
-  return slug || "org";
-}
+export { slugify } from "./validation";
 
 export async function storedTokenValue(token: string, hashTokens: boolean): Promise<string> {
   return hashTokens ? sha256Base64Url(token) : token;

@@ -67,3 +67,17 @@ model Organization {
   disabledAt DateTime? // plugin: set while the org is disabled by an admin
   // ...the org plugin's other fields and relations...
 }
+
+// The org plugin's Member model (shown partially). Recommended: one row per
+// user per org, enforced by the database. Neither Better Auth nor this plugin
+// declares it, so add it here and migrate.
+model Member {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  role           String
+  createdAt      DateTime
+  // ...the org plugin's other fields and relations...
+
+  @@unique([organizationId, userId])
+}

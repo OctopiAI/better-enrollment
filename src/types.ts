@@ -1,4 +1,5 @@
 import type { User } from "better-auth";
+import { VALIDATION_ERRORS } from "./validation";
 
 export type InviteMode = "invite-only" | "open";
 export type InviteType = "private" | "public";
@@ -190,8 +191,54 @@ export interface BetterEnrollmentOrgOptions {
     member: MemberRecord,
     org: OrganizationRecord
   ) => Promise<boolean> | boolean;
+  /**
+   * Org roles each member role may grant through org-join invites without
+   * holding member:update, e.g. `{ recruiter: ["member", "viewer"] }`.
+   * defaultOrganizationRole is always grantable. Granting any other role
+   * requires member:update in the org, the permission the org plugin
+   * itself requires to change a member's role.
+   *
+   * Only list roles that can do no more than the holder: the holder can
+   * invite a second address it controls. Checked at startup by the
+   * top-level grantableRolesCheck.
+   */
+  grantableRoles?: Record<string, string[]>;
+  /** Overrides the org role ceiling. Receives the requested org role string. */
+  canGrantOrgRole?: (
+    member: MemberRecord,
+    org: OrganizationRecord,
+    role: string
+  ) => Promise<boolean> | boolean;
   /** Allow org-join invites that grant the "owner" org role. Default false. */
   allowOwnerInvites?: boolean;
+  /**
+   * Org roles a public org-join invite may grant, like the top-level
+   * publicInviteRoles. Checked at create, resend and redemption. Default:
+   * any role.
+   */
+  publicInviteRoles?: string[];
+  /**
+   * Apply the seat limit to the org plugin's own /organization/invite-member
+   * and /organization/accept-invitation, which would otherwise add members
+   * past it. Default true; only orgs with a seat limit are affected. The
+   * server-only addMember is never checked (trusted server code). These
+   * checks cannot be atomic, since the org plugin does the writing.
+   */
+  enforceSeatLimitOnOrgPlugin?: boolean;
+  /**
+   * Run the org plugin's organizationHooks.beforeAddMember / afterAddMember
+   * when a redemption adds a member, and honor a numeric
+   * teams.maximumMembersPerTeam (a full team is skipped like a deleted
+   * one). Default false: these hooks were never called for invite
+   * redemptions, so turning them on may duplicate work you already do in
+   * onOrgMemberAdded.
+   */
+  runOrgPluginHooks?: boolean;
+  /**
+   * Also enforce the org plugin's membershipLimit at redemption, exactly as
+   * the org plugin does (its default is 100 members). Default false.
+   */
+  respectMembershipLimit?: boolean;
   /** Org role granted when an org-join invite does not name one. Default "member". */
   defaultOrganizationRole?: string;
   /** Org role granted to the founder via an org-create invite. Default "owner". */
@@ -227,14 +274,21 @@ export interface BetterEnrollmentOrgOptions {
     organization: OrganizationRecord;
     invite?: Invite;
   }) => Promise<void> | void;
+  /** skippedMembers: platform staff (the caller, invite admins) that banMembers left alone. */
   onOrgDisabled?: (data: {
     organization: OrganizationRecord;
     bannedMembers: number;
+    skippedMembers: number;
   }) => Promise<void> | void;
-  onOrgEnabled?: (data: { organization: OrganizationRecord }) => Promise<void> | void;
+  /** unbannedMembers: bans lifted by enableOrg's unbanMembers. */
+  onOrgEnabled?: (data: {
+    organization: OrganizationRecord;
+    unbannedMembers: number;
+  }) => Promise<void> | void;
   onOrgDeleted?: (data: {
     organization: OrganizationRecord;
     bannedMembers: number;
+    skippedMembers: number;
   }) => Promise<void> | void;
 }
 
@@ -270,6 +324,23 @@ export interface BetterEnrollmentOptions {
   expiresIn?: number;
   /** Public invite lifetime in seconds. null = never expires. Default 7 days. */
   publicExpiresIn?: number | null;
+  /**
+   * Upper bound, in seconds, on an `expiresIn` sent to create or resend.
+   * Larger values get UNPROCESSABLE_ENTITY. null = no cap. Default 365 days.
+   * Your own `expiresIn` / `publicExpiresIn` options are not capped.
+   */
+  maxExpiresIn?: number | null;
+  /**
+   * Upper bound on a public invite's `maxUses`. null = no cap.
+   * Default 10000.
+   */
+  maxPublicUses?: number | null;
+  /**
+   * Minimum seconds between two sends of the same private invite (create
+   * counts as the first). A resend sooner gets 429 RESEND_TOO_SOON.
+   * 0 = off. Default 60.
+   */
+  resendCooldown?: number;
 
   /**
    * Passwordless redemption for magic-link apps. "auto" (default) turns it
@@ -280,9 +351,8 @@ export interface BetterEnrollmentOptions {
    */
   passwordless?: boolean | "auto";
   /**
-   * Sign-in verification paths guarded against pre-created invite shells,
-   * for the session backstop hook. Default ["/magic-link/verify"]. Add
-   * other passwordless plugins' verify paths here.
+   * @deprecated Ignored. Pre-created invite shells are now refused a
+   * session on every path, so no per-path list is needed.
    */
   passwordlessVerifyPaths?: string[];
 
@@ -334,6 +404,40 @@ export interface BetterEnrollmentOptions {
    * adminRoles/adminUserIds entirely.
    */
   canManageInvites?: (user: User & { role?: string | null }) => Promise<boolean> | boolean;
+  /**
+   * App roles each role may grant through invites without holding the
+   * admin plugin's user:set-role, e.g. `{ support: ["user", "partner"] }`.
+   * defaultRole is always grantable. Any other role requires user:set-role
+   * (read from the admin plugin's own config), adminUserIds, or, without
+   * the admin plugin, an adminRoles role. Applies to create and to resend
+   * of public invites, which hands out the link.
+   *
+   * Only list roles that can do no more than the holder: the holder can
+   * invite a second address it controls, so a grantable role is
+   * effectively available to the holder. Holders can never redeem their
+   * own grantable-only invites. See grantableRolesCheck.
+   */
+  grantableRoles?: Record<string, string[]>;
+  /**
+   * App roles a public invite may grant. A public link reaches whoever holds
+   * it, so keep this to low roles. Checked at create, resend and redemption,
+   * so narrowing it also stops existing links. Default: any role.
+   */
+  publicInviteRoles?: string[];
+  /**
+   * Startup check for `grantableRoles` and `organization.grantableRoles`:
+   * each grantable role's access control permissions must be a subset of
+   * its holder's, because a holder can always send a grantable role to a
+   * second account it controls. "warn" (default) logs every gap and every
+   * entry it cannot verify (roles without declared statements, dynamic org
+   * roles); "error" throws at startup; "off" skips the check.
+   */
+  grantableRolesCheck?: "warn" | "error" | "off";
+  /** Overrides the app role ceiling. Receives the requested role string. */
+  canGrantRole?: (
+    user: User & { role?: string | null },
+    role: string
+  ) => Promise<boolean> | boolean;
 
   /**
    * Extra user fields collected when a redemption signs the invitee up
@@ -358,6 +462,15 @@ export interface BetterEnrollmentOptions {
    * Default: `${origin(baseURL)}/invite?token=${token}`.
    */
   buildInviteUrl?: (data: { token: string; type: InviteType; mode: InviteMode }) => string;
+  /**
+   * Where the default invite link carries its token. "query"
+   * (`/invite?token=`, default) or "fragment" (`/invite#token=`): a
+   * fragment never reaches servers, so it stays out of access logs, proxies
+   * and Referer headers. The page then reads `location.hash` and looks the
+   * invite up with POST, which takes the token in the body. Ignored when
+   * buildInviteUrl is set.
+   */
+  linkStyle?: "query" | "fragment";
 
   /** `admin` is null when the invite was created through the server-only system endpoint. */
   onInviteCreated?: (data: { invite: Invite; admin: User | null }) => Promise<void> | void;
@@ -368,9 +481,56 @@ export interface BetterEnrollmentOptions {
   /** Fires lazily when an expired invite is touched. May fire more than once. */
   onInviteExpired?: (data: { invite: Invite }) => Promise<void> | void;
   onInvalidRole?: (data: { invite: Invite; role: string }) => Promise<void> | void;
+  /**
+   * Fires when the plugin withdraws invites on its own because their
+   * inviter or invitee lost standing (see InviteCancelReason). Called once
+   * per batch of up to 1000 invites. `deleted` is true when the rows were
+   * deleted (inviter deleted) rather than cancelled. Errors are logged and
+   * never undo the cancellation.
+   */
+  onInvitesCancelled?: (data: InvitesCancelledData) => Promise<void> | void;
+
+  /**
+   * Re-check at redemption (and in invite.get) that the invite's creator
+   * still holds the rights it used: org membership with invitation:create
+   * and the org role ceiling for org-join, the invite gate and app role
+   * ceiling otherwise. Default false. An invite whose creator was deleted
+   * or banned is always withdrawn, with or without this option. Leave it
+   * off when createSystemInvite attributes invites to users who are not
+   * members of the target org.
+   */
+  revalidateInviterOnRedeem?: boolean;
 }
 
-const err = <const C extends string>(code: C, message: string) => ({
+/**
+ * Why invites were withdrawn automatically:
+ * - inviter-banned: the creator was banned (any path, or banMembers)
+ * - inviter-deleted: the creator's account was deleted (rows deleted)
+ * - invitee-deleted: the account the private invite is addressed to was deleted
+ * - inviter-removed-from-org / inviter-left-org: org-join invites of a former member
+ * - inviter-role-changed: org-join invites the creator's new org role may no longer create or grant
+ * - inviter-inactive: found at redemption or invite.get (creator gone, banned,
+ *   or, with revalidateInviterOnRedeem, no longer authorized)
+ */
+export type InviteCancelReason =
+  | "inviter-banned"
+  | "inviter-deleted"
+  | "invitee-deleted"
+  | "inviter-removed-from-org"
+  | "inviter-left-org"
+  | "inviter-role-changed"
+  | "inviter-inactive";
+
+export interface InvitesCancelledData {
+  reason: InviteCancelReason;
+  inviteIds: string[];
+  deleted: boolean;
+  /** The inviter or invitee the event is about, when known. */
+  userId: string | null;
+  organizationId: string | null;
+}
+
+const err =<const C extends string>(code: C, message: string) => ({
   code,
   message
 });
@@ -471,7 +631,24 @@ export const INVITE_ERROR_CODES = {
     "OWNER_INVITES_NOT_ALLOWED",
     "Invitations may not grant the owner role"
   ),
+  ROLE_NOT_GRANTABLE: err("ROLE_NOT_GRANTABLE", "You are not allowed to grant this role"),
+  ROLE_NOT_ALLOWED_FOR_PUBLIC_INVITE: err(
+    "ROLE_NOT_ALLOWED_FOR_PUBLIC_INVITE",
+    "Public invitations cannot grant this role"
+  ),
+  ORG_ROLE_NOT_GRANTABLE: err(
+    "ORG_ROLE_NOT_GRANTABLE",
+    "You are not allowed to grant this organization role"
+  ),
+  CANNOT_REDEEM_OWN_INVITE: err(
+    "CANNOT_REDEEM_OWN_INVITE",
+    "You cannot redeem an invitation that grants yourself a role you may not assign"
+  ),
   SEAT_LIMIT_REACHED: err("SEAT_LIMIT_REACHED", "This organization has no seats remaining"),
+  MEMBERSHIP_LIMIT_REACHED: err(
+    "MEMBERSHIP_LIMIT_REACHED",
+    "This organization has reached its membership limit"
+  ),
   PUBLIC_ORG_INVITE_REQUIRES_MAX_USES: err(
     "PUBLIC_ORG_INVITE_REQUIRES_MAX_USES",
     "Public invitations for a seat-limited organization must set maxUses"
@@ -481,5 +658,13 @@ export const INVITE_ERROR_CODES = {
     "organizationName and organizationSlug are required to accept this invitation"
   ),
   ORG_SLUG_TAKEN: err("ORG_SLUG_TAKEN", "An organization with this slug already exists"),
-  INVALID_CURSOR: err("INVALID_CURSOR", "The pagination cursor is invalid")
+  INVALID_CURSOR: err("INVALID_CURSOR", "The pagination cursor is invalid"),
+  INVALID_ORG_SLUG: err(VALIDATION_ERRORS.INVALID_ORG_SLUG.code, VALIDATION_ERRORS.INVALID_ORG_SLUG.message),
+  INVALID_ORG_NAME: err(VALIDATION_ERRORS.INVALID_ORG_NAME.code, VALIDATION_ERRORS.INVALID_ORG_NAME.message),
+  EXPIRES_IN_TOO_LONG: err("EXPIRES_IN_TOO_LONG", "The requested invitation lifetime is too long"),
+  MAX_USES_TOO_HIGH: err("MAX_USES_TOO_HIGH", "The requested number of uses is too high"),
+  RESEND_TOO_SOON: err(
+    "RESEND_TOO_SOON",
+    "This invitation was sent moments ago; wait before sending it again"
+  )
 } as const;

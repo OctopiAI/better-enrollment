@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
@@ -43,7 +44,14 @@ async function gatedAuth(): Promise<{ auth: TestAuth; headers: Headers; seen: Se
   return { auth, headers, seen };
 }
 
-describe("user.validateUserInfo (Better Auth >= 1.7)", () => {
+// The CI floor job runs this suite on Better Auth 1.6, which has no gate.
+const installed = JSON.parse(
+  readFileSync(new URL("../node_modules/better-auth/package.json", import.meta.url), "utf8")
+) as { version: string };
+const [major, minor] = installed.version.split(".").map(Number);
+const hasGate = major! > 1 || (major === 1 && minor! >= 7);
+
+describe.runIf(hasGate)("user.validateUserInfo (Better Auth >= 1.7)", () => {
   it("private invite: the pre-created shell passes the gate with method invite", async () => {
     const { auth, headers, seen } = await gatedAuth();
     const invite = await createInvite(auth, {
