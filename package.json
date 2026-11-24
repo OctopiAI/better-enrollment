@@ -9,10 +9,13 @@
     "email": "talat@octopi.ai",
     "url": "https://www.talatmahmud.dev"
   },
-  "homepage": "https://github.com/OctopiAI/better-enrollment",
+  "homepage": "https://better-enrollment.octopi.ai",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/OctopiAI/better-enrollment.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OctopiAI/better-enrollment/issues"
   },
   "keywords": [
     "better-auth",
